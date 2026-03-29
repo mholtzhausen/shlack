@@ -35,8 +35,7 @@ pub struct App {
     pub input_history: Vec<String>,
     pub aliases: Aliases,
     pub focus_on_chat_list: bool,
-    pub status_message: Option<String>,
-    pub status_expire: Option<std::time::Instant>,
+
     pub pane_areas: std::collections::HashMap<usize, Rect>,
     pub chat_list_area: Option<Rect>,
     pub chat_list_scroll_offset: usize,
@@ -56,6 +55,7 @@ pub struct App {
     pub show_user_colors: bool,
     pub show_borders: bool,
     pub mouse_support: bool,
+    pub highlight_words: Vec<String>,
     pub user_name_cache: std::collections::HashMap<String, String>,
     pub needs_redraw: bool,
     pub last_terminal_size: (u16, u16),
@@ -357,8 +357,6 @@ impl App {
             input_history: Vec::new(),
             aliases: app_state.aliases,
             focus_on_chat_list: true,
-            status_message: None,
-            status_expire: None,
             chat_list_area: None,
             chat_list_scroll_offset: 0,
             pending_open_chat: false,
@@ -376,6 +374,7 @@ impl App {
             show_user_colors: app_state.settings.show_user_colors,
             show_borders: app_state.settings.show_borders,
             mouse_support: app_state.settings.mouse_support,
+            highlight_words: app_state.settings.highlight_words.clone(),
             user_name_cache: std::collections::HashMap::new(),
             needs_redraw: true,
             last_terminal_size: (0, 0),
@@ -1450,8 +1449,6 @@ impl App {
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
-        let has_status = self.status_message.is_some();
-        
         // Check if we have mentions in other workspaces
         let current_workspace_name = self.config.workspaces
             .get(self.config.active_workspace)
@@ -1463,12 +1460,8 @@ impl App {
             .map(|(name, count)| (name.clone(), *count))
             .collect();
         let has_other_mentions = !other_workspace_mentions.is_empty();
-        
-        let main_constraints = if has_status && has_other_mentions {
-            vec![Constraint::Min(0), Constraint::Length(1), Constraint::Length(1)]
-        } else if has_status {
-            vec![Constraint::Min(0), Constraint::Length(1)]
-        } else if has_other_mentions {
+
+        let main_constraints = if has_other_mentions {
             vec![Constraint::Min(0), Constraint::Length(1)]
         } else {
             vec![Constraint::Min(0)]
@@ -1541,16 +1534,7 @@ impl App {
             let notification = Paragraph::new(format!(" Mentions in other workspaces: {} (Ctrl+N to switch)", mention_text))
                 .style(Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
                 .block(Block::default());
-            let notification_idx = if has_status { outer.len() - 2 } else { outer.len() - 1 };
-            f.render_widget(notification, outer[notification_idx]);
-        }
-
-        // Draw status bar
-        if has_status {
-            let status = Paragraph::new(self.status_message.as_ref().unwrap().clone())
-                .style(Style::default().bg(Color::DarkGray).fg(Color::White))
-                .block(Block::default());
-            f.render_widget(status, outer[outer.len() - 1]);
+            f.render_widget(notification, outer[outer.len() - 1]);
         }
     }
 
@@ -1774,6 +1758,7 @@ impl App {
         let show_line_numbers = self.show_line_numbers;
         let show_timestamps = self.show_timestamps;
         let show_user_colors = self.show_user_colors;
+        let highlight_words = &self.highlight_words;
         let user_cache = &self.user_name_cache;
         let resolve_user = |id: &str| -> String {
             user_cache
@@ -1856,8 +1841,7 @@ impl App {
                 username_style,
             ));
 
-            let mut content_spans = Vec::new();
-            content_spans.push(Span::raw(formatted_text));
+            let mut content_spans = highlight_spans(&formatted_text, highlight_words);
 
             // Add media indicator
             if let Some(ref media_type) = msg.media_type {
@@ -1918,20 +1902,34 @@ impl App {
             }
 
             let prefix_width = spans_width(&prefix_spans);
-            let indent = " ".repeat(prefix_width);
-            let indent_width = UnicodeWidthStr::width(indent.as_str());
-            let first_width = msg_width.saturating_sub(prefix_width);
-            let rest_width = msg_width.saturating_sub(indent_width);
+            let (first_width, rest_width, indent_str) = if msg.is_outgoing {
+                (msg_width.saturating_sub(prefix_width), msg_width, String::new())
+            } else {
+                let indent = " ".repeat(prefix_width);
+                let indent_width = UnicodeWidthStr::width(indent.as_str());
+                (
+                    msg_width.saturating_sub(prefix_width),
+                    msg_width.saturating_sub(indent_width),
+                    indent,
+                )
+            };
             let mut wrapped =
-                wrap_spans_hanging(&content_spans, first_width, rest_width, indent.as_str());
+                wrap_spans_hanging(&content_spans, first_width, rest_width, indent_str.as_str());
             if wrapped.is_empty() {
                 wrapped.push(Vec::new());
             }
             let mut first_line = prefix_spans;
             first_line.extend(wrapped.remove(0));
-            message_lines.push(Line::from(first_line));
-            for line in wrapped {
-                message_lines.push(Line::from(line));
+            if msg.is_outgoing {
+                message_lines.push(Line::from(first_line).alignment(ratatui::layout::Alignment::Right));
+                for line in wrapped {
+                    message_lines.push(Line::from(line).alignment(ratatui::layout::Alignment::Right));
+                }
+            } else {
+                message_lines.push(Line::from(first_line));
+                for line in wrapped {
+                    message_lines.push(Line::from(line));
+                }
             }
 
             // Show quoted/forwarded message as indented block (max 3 lines)
@@ -1974,7 +1972,7 @@ impl App {
         // Use ratatui's own line_count with inner width for accurate wrapping
         // line_count adds vertical space back, so subtract it to get content lines only
         let vertical_space = if self.show_borders { 2u16 } else { 0u16 };
-        let total_wrapped_lines = messages.line_count(msg_inner.width)
+        let total_wrapped_lines = messages.line_count(chunks[1].width)
             .saturating_sub(vertical_space as usize);
         let max_scroll = total_wrapped_lines.saturating_sub(msg_area_height);
         let scroll_offset = pane.scroll_offset.min(max_scroll);
@@ -2039,10 +2037,8 @@ impl App {
         }
     }
 
-    pub fn set_status(&mut self, message: &str) {
-        self.status_message = Some(message.to_string());
-        self.status_expire = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
-        self.needs_redraw = true;
+    pub fn set_status(&mut self, _message: &str) {
+        // Status bar removed; messages are silently discarded
     }
 
     pub fn save_state(&self) -> Result<()> {
@@ -2058,6 +2054,7 @@ impl App {
                 show_user_colors: self.show_user_colors,
                 show_borders: self.show_borders,
                 mouse_support: self.mouse_support,
+                highlight_words: self.highlight_words.clone(),
             },
             aliases: self.aliases.clone(),
             layout: LayoutData {
@@ -2597,6 +2594,7 @@ impl App {
                 show_user_colors: self.show_user_colors,
                 show_borders: self.show_borders,
                 mouse_support: self.mouse_support,
+                highlight_words: self.highlight_words.clone(),
             },
             aliases: self.aliases.clone(),
             layout: LayoutData::default(),
@@ -2732,6 +2730,66 @@ impl App {
             self.focused_pane_idx = self.panes.len() - 1;
         }
     }
+}
+
+/// Split `text` into styled spans, highlighting any occurrence of words in `highlight_words`
+/// with red bold text (case-insensitive). Returns plain spans if no words match.
+fn highlight_spans(text: &str, highlight_words: &[String]) -> Vec<Span<'static>> {
+    if highlight_words.is_empty() {
+        return vec![Span::raw(text.to_string())];
+    }
+
+    let text_lower = text.to_lowercase();
+    // Collect all match intervals [start, end) in byte positions
+    let mut intervals: Vec<(usize, usize)> = Vec::new();
+    for word in highlight_words {
+        if word.is_empty() {
+            continue;
+        }
+        let word_lower = word.to_lowercase();
+        let mut search_from = 0;
+        while let Some(pos) = text_lower[search_from..].find(word_lower.as_str()) {
+            let abs_start = search_from + pos;
+            let abs_end = abs_start + word.len();
+            intervals.push((abs_start, abs_end));
+            search_from = abs_start + 1;
+        }
+    }
+
+    if intervals.is_empty() {
+        return vec![Span::raw(text.to_string())];
+    }
+
+    // Sort and merge overlapping intervals
+    intervals.sort_by_key(|&(s, _)| s);
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in intervals {
+        if let Some(last) = merged.last_mut() {
+            if start < last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    let highlight_style = Style::default()
+        .fg(Color::Red)
+        .add_modifier(Modifier::BOLD);
+
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for (start, end) in merged {
+        if cursor < start {
+            spans.push(Span::raw(text[cursor..start].to_string()));
+        }
+        spans.push(Span::styled(text[start..end].to_string(), highlight_style));
+        cursor = end;
+    }
+    if cursor < text.len() {
+        spans.push(Span::raw(text[cursor..].to_string()));
+    }
+    spans
 }
 
 fn spans_width(spans: &[Span]) -> usize {

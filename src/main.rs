@@ -111,16 +111,6 @@ async fn run_app<B: ratatui::backend::Backend + std::io::Write>(
             }
         }
 
-        if let Some(expire) = app.status_expire {
-            if now >= expire {
-                app.status_message = None;
-                app.status_expire = None;
-                app.needs_redraw = true;
-            } else {
-                next_wake = next_wake.min(expire - now);
-            }
-        }
-
         // Resize detection
         let size = terminal.size()?;
         if (size.width, size.height) != app.last_terminal_size {

@@ -155,6 +155,9 @@ pub struct AppSettings {
 
     #[serde(default = "default_true")]
     pub mouse_support: bool,
+
+    #[serde(default)]
+    pub highlight_words: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -170,6 +173,7 @@ impl Default for AppSettings {
             show_user_colors: true,
             show_borders: true,
             mouse_support: true,
+            highlight_words: Vec::new(),
         }
     }
 }
@@ -212,6 +216,7 @@ impl AppState {
             show_user_colors: config.settings.show_user_colors,
             show_borders: config.settings.show_borders,
             mouse_support: config.settings.mouse_support,
+            highlight_words: Vec::new(),
         });
         
         Ok(Self {

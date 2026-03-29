@@ -67,6 +67,12 @@ impl CommandHandler {
             "media" => {
                 Self::handle_media(app, &cmd).await?;
             }
+            "highlight" | "hl" => {
+                Self::handle_highlight(app, &cmd).await?;
+            }
+            "unhighlight" | "unhl" => {
+                Self::handle_unhighlight(app, &cmd).await?;
+            }
             // /1, /2, /3... for quick workspace switching
             name if name.chars().all(|c| c.is_ascii_digit()) => {
                 if let Ok(num) = name.parse::<usize>() {
@@ -422,7 +428,47 @@ impl CommandHandler {
     }
 
     async fn handle_help(app: &mut App) -> Result<()> {
-        app.set_status("Commands: /thread N | /react <emoji> | /filter | /workspace | /leave | /alias | /media #N | /help");
+        app.set_status("Commands: /thread N | /react <emoji> | /filter | /workspace | /leave | /alias | /media #N | /highlight <word> | /unhighlight <word> | /help");
+        Ok(())
+    }
+
+    async fn handle_highlight(app: &mut App, cmd: &Command) -> Result<()> {
+        if cmd.args.is_empty() {
+            let words = if app.highlight_words.is_empty() {
+                "No highlight words set".to_string()
+            } else {
+                format!("Highlighted: {}", app.highlight_words.join(", "))
+            };
+            app.set_status(&words);
+            return Ok(());
+        }
+        let word = cmd.args.join(" ");
+        let word_lower = word.to_lowercase();
+        if app.highlight_words.iter().any(|w| w.to_lowercase() == word_lower) {
+            app.set_status(&format!("'{}' already highlighted", word));
+        } else {
+            app.highlight_words.push(word.clone());
+            app.set_status(&format!("Highlighting '{}'", word));
+            app.needs_redraw = true;
+        }
+        Ok(())
+    }
+
+    async fn handle_unhighlight(app: &mut App, cmd: &Command) -> Result<()> {
+        if cmd.args.is_empty() {
+            app.set_status("Usage: /unhighlight <word>");
+            return Ok(());
+        }
+        let word = cmd.args.join(" ");
+        let word_lower = word.to_lowercase();
+        let before = app.highlight_words.len();
+        app.highlight_words.retain(|w| w.to_lowercase() != word_lower);
+        if app.highlight_words.len() < before {
+            app.set_status(&format!("Removed highlight '{}'", word));
+            app.needs_redraw = true;
+        } else {
+            app.set_status(&format!("'{}' not in highlight list", word));
+        }
         Ok(())
     }
 }
