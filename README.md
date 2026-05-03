@@ -1,10 +1,10 @@
 # Slack Client (Rust TUI)
 
-Terminal-native Slack client built with Rust and ratatui. Supports multiple panes, live updates via Socket Mode, and a fast keyboard-first workflow.
+Terminal-native Slack client built with Rust and [ratatui](https://ratatui.rs). Multi-workspace, multi-pane, real-time via Socket Mode, with inline image previews via the Kitty graphics protocol.
 
 ## Overview
 
-This is a fully-featured terminal-based Slack client that brings the power of Slack to your terminal. Built for efficiency, it offers a keyboard-first interface with mouse support, multi-pane workflows, and real-time synchronization with your Slack workspace.
+A keyboard-first Slack client that lives entirely in your terminal. Multi-pane workflows, live updates over Socket Mode, optional inline image rendering for Kitty-compatible terminals, and persistent layout/settings across sessions.
 
 ## Key Features
 
@@ -49,7 +49,9 @@ This is a fully-featured terminal-based Slack client that brings the power of Sl
 - **Compact Mode**: Reduce spacing for more messages on screen (toggle with `Ctrl+D`)
 - **Color-Coded Usernames**: Each user gets a unique, consistent color for better visual distinction (toggle with `Ctrl+U`)
 - **Borderless Mode**: Remove all borders for a cleaner, minimalist interface (toggle with `Ctrl+Y`)
-- **Media Indicators**: Messages with images or videos are flagged with `[IMG]` or `[VIDEO]` markers
+- **Mouse Support**: Click-to-focus panes and chat-list scrolling (toggle with `Ctrl+M`)
+- **Media Indicators**: Messages with images or videos are flagged with `[img]` or `[video]` markers
+- **Inline Image Preview**: Auto-rendered thumbnails (8 rows tall) below image messages on terminals with the Kitty graphics protocol — enabled by default, toggle with `Ctrl+P`. Images are downloaded lazily for the visible viewport only and cached for the session.
 - **Formatting Cache**: Smart caching for smooth scrolling in long conversations
 
 ### Powerful Commands
@@ -79,6 +81,7 @@ This is a fully-featured terminal-based Slack client that brings the power of Sl
 
 ## Prerequisites
 - **Rust 1.70+** (`rustup` recommended for easy installation)
+- **Terminal** that supports 256+ colors. For inline image previews, a terminal that implements the Kitty graphics protocol (e.g. [Kitty](https://sw.kovidgoyal.net/kitty/), [WezTerm](https://wezterm.org), [Ghostty](https://ghostty.org), or any iTerm2-compatible terminal). Without it, image messages still show the `[img]` indicator and `/media #N` works as usual.
 - **Slack App** with Socket Mode enabled:
   - **App-Level Token** with `connections:write` scope (starts with `xapp-...`)
   - **User OAuth Token** (starts with `xoxp-...`) or **Bot User OAuth Token** (starts with `xoxb-...`)
@@ -174,11 +177,13 @@ Configuration files are stored in `~/.config/slack_client_rs/`:
 ### Display Options
 - **Ctrl+E** – Toggle emoji reactions display
 - **Ctrl+O** – Toggle emoji rendering
+- **Ctrl+P** – Toggle inline image preview (Kitty graphics protocol)
 - **Ctrl+T** – Toggle message timestamps
 - **Ctrl+G** – Toggle message line numbers
 - **Ctrl+D** – Toggle compact mode (reduced spacing)
 - **Ctrl+U** – Toggle color-coded usernames
 - **Ctrl+Y** – Toggle borders (for cleaner UI)
+- **Ctrl+M** – Toggle mouse support
 
 ### System Commands
 - **Ctrl+R** – Refresh channel list
@@ -354,7 +359,9 @@ The `slack_config.json` supports multiple workspaces:
     "show_timestamps": true,
     "show_chat_list": true,
     "show_user_colors": true,
-    "show_borders": true
+    "show_borders": true,
+    "mouse_support": true,
+    "show_image_preview": true
   }
 }
 ```
@@ -382,6 +389,11 @@ The client automatically converts old single-workspace configs to the new format
 - Increase terminal size for better layout with multiple panes
 - Toggle `Ctrl+D` for compact mode if messages are too spaced out
 - Use `Ctrl+S` to hide the channel list for more message space
+
+### Inline Image Preview Not Showing
+- Image preview requires a terminal supporting the Kitty graphics protocol. On startup the client probes for it; if probing fails it prints `Image preview disabled (picker init failed): …` and silently falls back to the `[img]` text indicator.
+- Toggle the feature with `Ctrl+P`. State is persisted in `slack_config.json` as `show_image_preview`.
+- `/media #N` is independent of the inline preview and downloads the file to `./store/`, then opens it with the OS default app.
 
 ## Contributing
 
