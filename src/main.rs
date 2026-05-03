@@ -201,8 +201,14 @@ async fn run_app<B: ratatui::backend::Backend + std::io::Write>(
                         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.toggle_emojis();
                         }
-                        // Ctrl+P: Toggle inline image preview
-                        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Ctrl+P: Toggle inline image preview.
+                        // Some terminals report Ctrl+P as DC1 ('\u{10}') without CONTROL modifier.
+                        KeyCode::Char('p')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            app.toggle_image_preview();
+                        }
+                        KeyCode::Char('\u{10}') => {
                             app.toggle_image_preview();
                         }
                         // Ctrl+T: Toggle timestamps
@@ -399,4 +405,3 @@ async fn run_app<B: ratatui::backend::Backend + std::io::Write>(
 
     Ok(())
 }
-
