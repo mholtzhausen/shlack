@@ -122,6 +122,8 @@ pub struct AppState {
     pub settings: AppSettings,
     pub aliases: Aliases,
     pub layout: LayoutData,
+    #[serde(default)]
+    pub workspace_unread_counts: HashMap<String, HashMap<String, u32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,8 +158,15 @@ pub struct AppSettings {
     #[serde(default = "default_true")]
     pub mouse_support: bool,
 
-    #[serde(default)]
-    pub highlight_words: Vec<String>,
+    #[serde(default = "default_true")]
+    pub show_image_preview: bool,
+
+    #[serde(default = "default_collapsed_sections")]
+    pub collapsed_sections: Vec<String>,
+}
+
+fn default_collapsed_sections() -> Vec<String> {
+    vec!["New".to_string()]
 }
 
 impl Default for AppSettings {
@@ -173,7 +182,8 @@ impl Default for AppSettings {
             show_user_colors: true,
             show_borders: true,
             mouse_support: true,
-            highlight_words: Vec::new(),
+            show_image_preview: true,
+            collapsed_sections: default_collapsed_sections(),
         }
     }
 }
@@ -216,13 +226,15 @@ impl AppState {
             show_user_colors: config.settings.show_user_colors,
             show_borders: config.settings.show_borders,
             mouse_support: config.settings.mouse_support,
-            highlight_words: Vec::new(),
+            show_image_preview: config.settings.show_image_preview,
+            collapsed_sections: default_collapsed_sections(),
         });
         
         Ok(Self {
             settings,
             aliases: Aliases::load(config)?,
             layout: LayoutData::load(config)?,
+            workspace_unread_counts: HashMap::new(),
         })
     }
 

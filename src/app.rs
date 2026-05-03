@@ -15,13 +15,10 @@ use crate::commands::CommandHandler;
 use crate::config::Config;
 use crate::formatting::{format_message_text, slack_emoji_to_unicode};
 use crate::persistence::{Aliases, AppState, LayoutData};
-use crate::slack::{SlackAttachment, SlackClient, SlackUpdate};
+use crate::slack::{SlackAttachment, SlackClient, SlackMessage, SlackUpdate};
 use crate::split_view::{PaneNode, SplitDirection};
-use crate::utils::send_desktop_notification;
+use crate::utils::send_desktop_notification_ex;
 use crate::widgets::ChatPane;
-
-const REALTIME_STALE_SECS: u64 = 30;
-const FALLBACK_REFRESH_SECS: u64 = 15;
 
 pub struct App {
     pub config: Config,
@@ -35,11 +32,15 @@ pub struct App {
     pub input_history: Vec<String>,
     pub aliases: Aliases,
     pub focus_on_chat_list: bool,
-
+    pub status_message: Option<String>,
+    pub status_expire: Option<std::time::Instant>,
     pub pane_areas: std::collections::HashMap<usize, Rect>,
     pub chat_list_area: Option<Rect>,
     pub chat_list_scroll_offset: usize,
     pub pending_open_chat: bool,
+    pending_open_chat_load: Option<
+        tokio::sync::oneshot::Receiver<Result<OpenChatLoadResult, String>>,
+    >,
     pub pending_refresh_chats: bool,
     pub pending_reload_panes: bool,
     pub pending_workspace_switch: Option<tokio::sync::oneshot::Receiver<Result<(SlackClient, String), String>>>,
@@ -55,27 +56,36 @@ pub struct App {
     pub show_user_colors: bool,
     pub show_borders: bool,
     pub mouse_support: bool,
-    pub highlight_words: Vec<String>,
+    pub show_image_preview: bool,
     pub user_name_cache: std::collections::HashMap<String, String>,
     pub needs_redraw: bool,
     pub last_terminal_size: (u16, u16),
     pub next_local_echo_id: u64,
     pub unread_mentions: std::collections::HashMap<String, u32>, // workspace_name -> count
-    pub app_start_instant: std::time::Instant,
-    pub last_realtime_event_instant: Option<std::time::Instant>,
-    pub last_realtime_event_at: Option<chrono::DateTime<chrono::Local>>,
-    pub last_fallback_refresh_instant: std::time::Instant,
-    pub last_fallback_refresh_at: Option<chrono::DateTime<chrono::Local>>,
-    pub realtime_was_stale: bool,
+    pub workspace_unread_cache: std::collections::HashMap<String, std::collections::HashMap<String, u32>>,
+    pub collapsed_sections: std::collections::HashSet<String>,
+
+    // Inline image preview (Kitty graphics protocol via ratatui-image)
+    pub image_picker: Option<ratatui_image::picker::Picker>,
+    pub image_cache: std::cell::RefCell<std::collections::HashMap<String, ImageCacheEntry>>,
+    pub image_load_tx: tokio::sync::mpsc::UnboundedSender<(String, std::result::Result<image::DynamicImage, String>)>,
+    pub image_load_rx: tokio::sync::mpsc::UnboundedReceiver<(String, std::result::Result<image::DynamicImage, String>)>,
+}
+
+pub enum ImageCacheEntry {
+    Loading,
+    Loaded(ratatui_image::protocol::StatefulProtocol),
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ChatSection {
     Public = 0,
     Private = 1,
-    Group = 2,
-    DirectMessage = 3,
-    Bot = 4,
+    Shared = 2,
+    Group = 3,
+    DirectMessage = 4,
+    Bot = 5,
 }
 
 impl ChatSection {
@@ -83,8 +93,9 @@ impl ChatSection {
         match self {
             ChatSection::Public => "Public Channels",
             ChatSection::Private => "Private Channels",
+            ChatSection::Shared => "Shared Channels",
             ChatSection::Group => "Group Chats",
-            ChatSection::DirectMessage => "Messages",
+            ChatSection::DirectMessage => "DMs",
             ChatSection::Bot => "Bots & Apps",
         }
     }
@@ -136,26 +147,15 @@ pub struct ChatInfo {
     pub section: ChatSection,
 }
 
+struct OpenChatLoadResult {
+    pane_idx: usize,
+    channel_id: String,
+    messages: Vec<SlackMessage>,
+    name_cache: std::collections::HashMap<String, String>,
+}
+
 fn detect_media_type(files: &[crate::slack::SlackFile]) -> Option<(String, Vec<String>, Vec<String>, Vec<String>)> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    
-    let log_to_file = |msg: &str| {
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/slack_rust_debug.log")
-        {
-            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-            let _ = writeln!(file, "[{}] {}", timestamp, msg);
-        }
-    };
-    
-    log_to_file(&format!("=== DETECT MEDIA TYPE DEBUG ==="));
-    log_to_file(&format!("Number of files: {}", files.len()));
-    
     if files.is_empty() {
-        log_to_file("No files, returning None");
         return None;
     }
     
@@ -165,10 +165,7 @@ fn detect_media_type(files: &[crate::slack::SlackFile]) -> Option<(String, Vec<S
     let mut file_urls = Vec::new();
     let mut file_names = Vec::new();
     
-    for (idx, file) in files.iter().enumerate() {
-        log_to_file(&format!("File {}: id={:?}, mimetype={:?}, filetype={:?}, url_private={:?}, name={:?}", 
-            idx, file.id, file.mimetype, file.filetype, file.url_private, file.name));
-        
+    for file in files {
         if let Some(ref id) = file.id {
             file_ids.push(id.clone());
         }
@@ -189,39 +186,28 @@ fn detect_media_type(files: &[crate::slack::SlackFile]) -> Option<(String, Vec<S
         }
         
         if let Some(ref mimetype) = file.mimetype {
-            log_to_file(&format!("  Checking mimetype: {}", mimetype));
             if mimetype.starts_with("image/") {
                 has_image = true;
-                log_to_file("  -> Detected as image");
             } else if mimetype.starts_with("video/") {
                 has_video = true;
-                log_to_file("  -> Detected as video");
             }
         } else if let Some(ref filetype) = file.filetype {
-            log_to_file(&format!("  Checking filetype: {}", filetype));
             if filetype == "jpg" || filetype == "jpeg" || filetype == "png" || 
                filetype == "gif" || filetype == "webp" || filetype == "svg" {
                 has_image = true;
-                log_to_file("  -> Detected as image");
             } else if filetype == "mp4" || filetype == "mov" || filetype == "webm" {
                 has_video = true;
-                log_to_file("  -> Detected as video");
             }
         }
     }
     
-    let result = if has_video {
-        log_to_file(&format!("Final result: video, {} files", file_urls.len()));
+    if has_video {
         Some(("video".to_string(), file_ids, file_urls, file_names))
     } else if has_image {
-        log_to_file(&format!("Final result: image, {} files", file_urls.len()));
         Some(("image".to_string(), file_ids, file_urls, file_names))
     } else {
-        log_to_file("Final result: None (no media detected)");
         None
-    };
-    
-    result
+    }
 }
 
 fn forwarded_preview(attachments: &[SlackAttachment]) -> Option<String> {
@@ -300,6 +286,7 @@ impl App {
             settings: crate::persistence::AppSettings::default(),
             aliases: Aliases::default(),
             layout: LayoutData::default(),
+            workspace_unread_counts: std::collections::HashMap::new(),
         });
 
         // Load initial chats
@@ -307,6 +294,15 @@ impl App {
             eprintln!("Failed to load conversations: {e}");
             Vec::new()
         });
+        if let Some(saved_unread) = app_state.workspace_unread_counts.get(&workspace.name) {
+            for chat in &mut chats {
+                if chat.unread == 0 {
+                    if let Some(saved) = saved_unread.get(&chat.id) {
+                        chat.unread = *saved;
+                    }
+                }
+            }
+        }
         chats.sort_by_key(|c| (c.section as u8, c.name.to_lowercase()));
 
         // Load pane tree
@@ -345,6 +341,10 @@ impl App {
             0
         };
 
+        let workspace_unread_cache = app_state.workspace_unread_counts.clone();
+
+        let (image_load_tx, image_load_rx) = tokio::sync::mpsc::unbounded_channel();
+
         let app = Self {
             config,
             slack,
@@ -357,9 +357,12 @@ impl App {
             input_history: Vec::new(),
             aliases: app_state.aliases,
             focus_on_chat_list: true,
+            status_message: None,
+            status_expire: None,
             chat_list_area: None,
             chat_list_scroll_offset: 0,
             pending_open_chat: false,
+            pending_open_chat_load: None,
             pending_refresh_chats: false,
             pending_reload_panes: false,
             pending_workspace_switch: None,
@@ -374,18 +377,23 @@ impl App {
             show_user_colors: app_state.settings.show_user_colors,
             show_borders: app_state.settings.show_borders,
             mouse_support: app_state.settings.mouse_support,
-            highlight_words: app_state.settings.highlight_words.clone(),
+            show_image_preview: app_state.settings.show_image_preview,
             user_name_cache: std::collections::HashMap::new(),
             needs_redraw: true,
             last_terminal_size: (0, 0),
             next_local_echo_id: 1,
             unread_mentions: std::collections::HashMap::new(),
-            app_start_instant: std::time::Instant::now(),
-            last_realtime_event_instant: None,
-            last_realtime_event_at: None,
-            last_fallback_refresh_instant: std::time::Instant::now(),
-            last_fallback_refresh_at: None,
-            realtime_was_stale: false,
+            workspace_unread_cache,
+            collapsed_sections: app_state
+                .settings
+                .collapsed_sections
+                .iter()
+                .cloned()
+                .collect(),
+            image_picker: None,
+            image_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            image_load_tx,
+            image_load_rx,
         };
 
         Ok(app)
@@ -560,51 +568,8 @@ impl App {
         Ok(())
     }
 
-    fn realtime_status_text(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        let now = std::time::Instant::now();
-
-        if let Some(last) = self.last_realtime_event_instant {
-            let age = now.duration_since(last).as_secs();
-            let state = if age >= REALTIME_STALE_SECS { "stale" } else { "ok" };
-            parts.push(format!("RT:{} {}s", state, age));
-        } else {
-            parts.push("RT:none".to_string());
-        }
-
-        if let Some(ts) = self.last_realtime_event_at.as_ref() {
-            parts.push(format!("last {}", ts.format("%H:%M:%S")));
-        }
-
-        if let Some(fb) = self.last_fallback_refresh_at.as_ref() {
-            parts.push(format!("FB {}", fb.format("%H:%M:%S")));
-        }
-
-        if parts.is_empty() {
-            String::new()
-        } else {
-            format!(" | {}", parts.join(" | "))
-        }
-    }
-
     pub async fn process_slack_events(&mut self) -> Result<()> {
         let updates = self.slack.get_pending_updates().await;
-        
-        if !updates.is_empty() {
-            let now = std::time::Instant::now();
-            self.last_realtime_event_instant = Some(now);
-            self.last_realtime_event_at = Some(chrono::Local::now());
-            self.realtime_was_stale = false;
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/slack_rust_debug.log")
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-                    writeln!(f, "[{}] Processing {} updates in app.rs", timestamp, updates.len())
-                });
-        }
 
         for update in updates {
             match update {
@@ -620,34 +585,9 @@ impl App {
                     mentions_me,
                     files,
                 } => {
-                    use std::fs::OpenOptions;
-                    use std::io::Write;
-                    
-                    let log_to_file = |msg: &str| {
-                        if let Ok(mut file) = OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/tmp/slack_rust_debug.log")
-                        {
-                            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-                            let _ = writeln!(file, "[{}] {}", timestamp, msg);
-                        }
-                    };
-                    
-                    log_to_file(&format!("=== PROCESS NEW MESSAGE UPDATE ==="));
-                    log_to_file(&format!("channel_id: {}, user_name: {}, ts: {}", channel_id, user_name, ts));
-                    log_to_file(&format!("thread_ts: {:?}, files count: {}", thread_ts, files.len()));
-                    for (idx, file) in files.iter().enumerate() {
-                        log_to_file(&format!("  File {}: id={:?}, mimetype={:?}, filetype={:?}", 
-                            idx, file.id, file.mimetype, file.filetype));
-                    }
-                    
                     let (media_type, file_ids, file_urls, file_names) = detect_media_type(&files)
                         .map(|(mt, ids, urls, names)| (Some(mt), ids, urls, names))
                         .unwrap_or((None, Vec::new(), Vec::new(), Vec::new()));
-                    
-                    log_to_file(&format!("Detected media_type: {:?}, file_ids: {:?}, file_urls: {:?}, file_names: {:?}", 
-                        media_type, file_ids, file_urls, file_names));
                     let is_thread_reply = matches!(thread_ts.as_ref(), Some(t) if t != &ts);
                     let root_thread_ts = thread_ts.clone().unwrap_or_else(|| ts.clone());
 
@@ -757,46 +697,97 @@ impl App {
                         }
                     }
 
-                    // Mark channel as unread if it's not currently visible
+                    // Mark channel as unread if it's not currently the focused pane.
+                    // We still show an unread marker for channels visible in non-focused panes
+                    // so the user clearly sees where new activity happened.
+                    let is_focused_channel = self
+                        .panes
+                        .get(self.focused_pane_idx)
+                        .and_then(|p| p.channel_id_str.as_deref())
+                        .map(|cid| cid == channel_id.as_str())
+                        .unwrap_or(false);
+                    let focused_pane_saw_it = seen_in_open_pane && is_focused_channel && !self.focus_on_chat_list;
+
+                    let known_channel = self.chats.iter().any(|c| c.id == channel_id);
                     if let Some(chat) = self.chats.iter_mut().find(|c| c.id == channel_id) {
-                        if seen_in_open_pane {
+                        if focused_pane_saw_it {
                             chat.unread = 0;
                         } else if !is_self {
                             chat.unread = chat.unread.saturating_add(1);
                         }
+                    } else if !is_self {
+                        // Unknown channel (e.g. new DM, newly added channel) – refresh the
+                        // chat list from the API so it appears in the sidebar.
+                        self.pending_refresh_chats = true;
                     }
+                    let _ = known_channel;
 
                     self.needs_redraw = true;
 
-                    // Send notification only when mentioned
-                    if self.show_notifications && !is_bot && !is_self && mentions_me {
-                        let channel_name = self
+                    // Desktop notifications: notify for DMs and group chats on every
+                    // new message, and for any channel/bot when the user is mentioned.
+                    // Suppress notifications for the user's own messages, and when the
+                    // currently-focused pane already showed the message.
+                    if self.show_notifications && !is_self && !focused_pane_saw_it {
+                        let chat_section = self
                             .chats
                             .iter()
                             .find(|c| c.id == channel_id)
-                            .map(|c| c.name.clone())
-                            .or_else(|| {
-                                self.panes
-                                    .iter()
-                                    .find(|p| {
-                                        p.channel_id_str.as_deref() == Some(channel_id.as_str())
-                                    })
-                                    .map(|p| p.chat_name.clone())
-                            })
-                            .unwrap_or_else(|| channel_id.clone());
-                        let title = channel_name;
-                        
-                        // Increment unread mention counter for current workspace
-                        let workspace_name = self.config.workspaces
-                            .get(self.config.active_workspace)
-                            .map(|w| w.name.clone())
-                            .unwrap_or_default();
-                        *self.unread_mentions.entry(workspace_name).or_insert(0) += 1;
-                        
-                        let _ = send_desktop_notification(
-                            &format!("Slack: {} - You were mentioned!", title),
-                            &format!("{}: {}", user_name, text),
+                            .map(|c| c.section);
+                        let is_direct = matches!(
+                            chat_section,
+                            Some(ChatSection::DirectMessage) | Some(ChatSection::Group)
                         );
+
+                        let should_notify = mentions_me || (is_direct && !is_bot);
+
+                        if should_notify {
+                            let channel_name = self
+                                .chats
+                                .iter()
+                                .find(|c| c.id == channel_id)
+                                .map(|c| c.name.clone())
+                                .or_else(|| {
+                                    self.panes
+                                        .iter()
+                                        .find(|p| {
+                                            p.channel_id_str.as_deref()
+                                                == Some(channel_id.as_str())
+                                        })
+                                        .map(|p| p.chat_name.clone())
+                                })
+                                .unwrap_or_else(|| channel_id.clone());
+
+                            let workspace_name = self.config.workspaces
+                                .get(self.config.active_workspace)
+                                .map(|w| w.name.clone())
+                                .unwrap_or_default();
+
+                            let (title, urgency) = if mentions_me {
+                                *self
+                                    .unread_mentions
+                                    .entry(workspace_name.clone())
+                                    .or_insert(0) += 1;
+                                (
+                                    format!(
+                                        "Slack [{}]: {} - mention",
+                                        workspace_name, channel_name
+                                    ),
+                                    "critical",
+                                )
+                            } else {
+                                (
+                                    format!("Slack [{}]: {}", workspace_name, channel_name),
+                                    "normal",
+                                )
+                            };
+
+                            let _ = send_desktop_notification_ex(
+                                &title,
+                                &format!("{}: {}", user_name, text),
+                                urgency,
+                            );
+                        }
                     }
                 }
                 SlackUpdate::MessageChanged {
@@ -859,179 +850,53 @@ impl App {
     }
 
     pub async fn refresh_chats(&mut self) -> Result<()> {
-        self.chats = self.slack.get_conversations().await?;
+        // Preserve locally tracked unread counts across refresh (the Slack API's
+        // unread_count field is only populated for user tokens with specific scopes
+        // and would otherwise wipe our live activity markers).
+        let workspace_name = self.config.workspaces
+            .get(self.config.active_workspace)
+            .map(|w| w.name.clone())
+            .unwrap_or_default();
+        let prev_unread: std::collections::HashMap<String, u32> = self
+            .chats
+            .iter()
+            .map(|c| (c.id.clone(), c.unread))
+            .collect();
+        let saved_unread = self
+            .workspace_unread_cache
+            .get(&workspace_name)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut new_chats = self.slack.get_conversations().await?;
+        for chat in &mut new_chats {
+            if chat.unread == 0 {
+                if let Some(prev) = prev_unread.get(&chat.id) {
+                    chat.unread = *prev;
+                } else if let Some(saved) = saved_unread.get(&chat.id) {
+                    chat.unread = *saved;
+                }
+            }
+        }
+        self.chats = new_chats;
         self.chats
             .sort_by_key(|c| (c.section as u8, c.name.to_lowercase()));
+        self.workspace_unread_cache.insert(
+            workspace_name,
+            self.chats
+                .iter()
+                .map(|c| (c.id.clone(), c.unread))
+                .collect(),
+        );
         if self.selected_chat_idx >= self.chats.len() {
             self.selected_chat_idx = self.chats.len().saturating_sub(1);
         }
         self.set_status("Chats refreshed");
         Ok(())
     }
-    
-    async fn reload_pane_at(&mut self, pane_idx: usize) -> Result<()> {
-        if pane_idx >= self.panes.len() {
-            return Ok(());
-        }
-
-        let (channel_id, thread_ts) = {
-            let pane = &self.panes[pane_idx];
-            (pane.channel_id_str.clone(), pane.thread_ts.clone())
-        };
-
-        let Some(channel_id) = channel_id else {
-            return Ok(());
-        };
-
-        if let Some(thread_ts) = thread_ts {
-            match self.slack.get_thread_replies(&channel_id, &thread_ts, 100).await {
-                Ok(messages) => {
-                    let name_cache = self.user_name_cache.clone();
-                    let pane = &mut self.panes[pane_idx];
-                    pane.msg_data.clear();
-                    for slack_msg in &messages {
-                        let sender_name = if let Some(ref user_id) = slack_msg.user {
-                            name_cache.get(user_id).cloned().unwrap_or_else(|| user_id.clone())
-                        } else if let Some(ref bot_profile) = slack_msg.bot_profile {
-                            bot_profile.name.clone().unwrap_or_else(|| "Bot".to_string())
-                        } else if let Some(ref username) = slack_msg.username {
-                            username.clone()
-                        } else {
-                            "Unknown".to_string()
-                        };
-
-                        let (media_type, file_ids, file_urls, file_names) =
-                            detect_media_type(&slack_msg.files)
-                                .map(|(mt, ids, urls, names)| (Some(mt), ids, urls, names))
-                                .unwrap_or((None, Vec::new(), Vec::new(), Vec::new()));
-
-                        let msg_data = crate::widgets::MessageData {
-                            sender_name,
-                            text: slack_msg.text.clone(),
-                            is_outgoing: slack_msg.user.as_deref() == Some(&self.my_user_id),
-                            ts: slack_msg.ts.clone(),
-                            reactions: slack_msg
-                                .reactions
-                                .iter()
-                                .map(|r| (r.name.clone(), r.count))
-                                .collect(),
-                            reply_count: slack_msg.reply_count.unwrap_or(0),
-                            forwarded_text: None,
-                            mentions_me: false,
-                            local_echo_id: None,
-                            is_edited: false,
-                            is_deleted: false,
-                            media_type,
-                            file_ids,
-                            file_urls,
-                            file_names,
-                        };
-                        pane.msg_data.push(msg_data);
-                    }
-                    pane.invalidate_cache();
-                }
-                Err(_) => {}
-            }
-        } else {
-            match self.slack.get_conversation_history(&channel_id, 100).await {
-                Ok(messages) => {
-                    let name_cache = self.user_name_cache.clone();
-                    let pane = &mut self.panes[pane_idx];
-                    pane.msg_data.clear();
-                    for slack_msg in messages.iter().rev() {
-                        let sender_name = if let Some(ref user_id) = slack_msg.user {
-                            name_cache.get(user_id).cloned().unwrap_or_else(|| user_id.clone())
-                        } else if let Some(ref bot_profile) = slack_msg.bot_profile {
-                            bot_profile.name.clone().unwrap_or_else(|| "Bot".to_string())
-                        } else if let Some(ref username) = slack_msg.username {
-                            username.clone()
-                        } else {
-                            "Unknown".to_string()
-                        };
-
-                        let mentions_me =
-                            Self::message_mentions_user(&slack_msg.text, &self.my_user_id);
-                        let (media_type, file_ids, file_urls, file_names) =
-                            detect_media_type(&slack_msg.files)
-                                .map(|(mt, ids, urls, names)| (Some(mt), ids, urls, names))
-                                .unwrap_or((None, Vec::new(), Vec::new(), Vec::new()));
-
-                        let msg_data = crate::widgets::MessageData {
-                            sender_name,
-                            text: slack_msg.text.clone(),
-                            is_outgoing: slack_msg.user.as_deref() == Some(&self.my_user_id),
-                            ts: slack_msg.ts.clone(),
-                            reactions: slack_msg
-                                .reactions
-                                .iter()
-                                .map(|r| (r.name.clone(), r.count))
-                                .collect(),
-                            reply_count: slack_msg.reply_count.unwrap_or(0),
-                            forwarded_text: None,
-                            mentions_me,
-                            local_echo_id: None,
-                            is_edited: false,
-                            is_deleted: false,
-                            media_type,
-                            file_ids,
-                            file_urls,
-                            file_names,
-                        };
-                        pane.msg_data.push(msg_data);
-                    }
-                    pane.invalidate_cache();
-                }
-                Err(_) => {}
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn maybe_run_fallback_refresh(&mut self) -> Result<()> {
-        let now = std::time::Instant::now();
-        let app_age_secs = now.duration_since(self.app_start_instant).as_secs();
-        let now_stale = if app_age_secs < REALTIME_STALE_SECS {
-            false
-        } else if let Some(last) = self.last_realtime_event_instant {
-            now.duration_since(last).as_secs() >= REALTIME_STALE_SECS
-        } else {
-            true
-        };
-
-        if now_stale && !self.realtime_was_stale {
-            self.realtime_was_stale = true;
-            self.set_status("Realtime stale; fallback refresh active");
-        } else if !now_stale && self.realtime_was_stale {
-            self.realtime_was_stale = false;
-        }
-
-        if !now_stale {
-            return Ok(());
-        }
-
-        if now
-            .duration_since(self.last_fallback_refresh_instant)
-            .as_secs()
-            < FALLBACK_REFRESH_SECS
-        {
-            return Ok(());
-        }
-
-        self.last_fallback_refresh_instant = now;
-        self.last_fallback_refresh_at = Some(chrono::Local::now());
-        let pane_idx = self.focused_pane_idx;
-        let _ = self.reload_pane_at(pane_idx).await;
-        self.needs_redraw = true;
-        Ok(())
-    }
 
     pub async fn reload_pane_contents(&mut self) -> Result<()> {
-        // Reload messages for all panes that have a channel set
-        for idx in 0..self.panes.len() {
-            let _ = self.reload_pane_at(idx).await;
-        }
-        Ok(())
+        self.load_all_pane_histories().await
     }
 
     pub async fn open_selected_chat(&mut self) -> Result<()> {
@@ -1041,7 +906,8 @@ impl App {
         }
 
         let chat = self.chats[self.selected_chat_idx].clone();
-        let pane = &mut self.panes[self.focused_pane_idx];
+        let pane_idx = self.focused_pane_idx;
+        let pane = &mut self.panes[pane_idx];
 
         // Use string channel ID (Slack IDs are not numeric)
         pane.chat_id = None;
@@ -1064,114 +930,71 @@ impl App {
             .unwrap_or_default();
         self.unread_mentions.insert(workspace_name, 0);
 
-        // Load messages (reduced from 500 to 100 for faster loading)
-        match self.slack.get_conversation_history(&chat.id, 100).await {
-            Ok(messages) => {
-                // Use the global user name cache instead of fetching names again
-                let name_cache = self.user_name_cache.clone();
-                
-                // Collect unique user IDs and bot IDs that we don't have cached yet
-                let mut users_to_fetch = Vec::new();
-                let mut bots_to_fetch = Vec::new();
-                
+        self.pending_open_chat_load = None;
+        let slack = self.slack.clone();
+        let channel_id = chat.id.clone();
+        let known_names = self.user_name_cache.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let result = async {
+                let messages = slack
+                    .get_conversation_history(&channel_id, 100)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                let mut name_cache = known_names;
+                let mut users_to_fetch = std::collections::HashSet::new();
+                let mut bots_to_fetch = std::collections::HashSet::new();
+
                 for slack_msg in &messages {
                     if let Some(ref uid) = slack_msg.user {
                         if !name_cache.contains_key(uid) {
-                            users_to_fetch.push(uid.clone());
+                            users_to_fetch.insert(uid.clone());
                         }
                     }
                     if let Some(ref bot_id) = slack_msg.bot_id {
                         if !name_cache.contains_key(bot_id) {
-                            bots_to_fetch.push(bot_id.clone());
+                            bots_to_fetch.insert(bot_id.clone());
                         }
                     }
                 }
-                
-                // Fetch names in parallel for better performance
+
                 let mut fetch_tasks = Vec::new();
                 for uid in users_to_fetch {
-                    let slack = self.slack.clone();
+                    let slack = slack.clone();
                     fetch_tasks.push(tokio::spawn(async move {
                         (uid.clone(), slack.resolve_user_name(&uid).await)
                     }));
                 }
                 for bot_id in bots_to_fetch {
-                    let slack = self.slack.clone();
+                    let slack = slack.clone();
                     fetch_tasks.push(tokio::spawn(async move {
                         (bot_id.clone(), slack.resolve_bot_name(&bot_id).await)
                     }));
                 }
-                
-                // Wait for all fetches to complete and update cache
+
                 for task in fetch_tasks {
                     if let Ok((id, name)) = task.await {
-                        self.user_name_cache.insert(id, name);
+                        name_cache.insert(id, name);
                     }
                 }
-                
-                let name_cache = &self.user_name_cache;
 
-                for slack_msg in messages.iter().rev() {
-                    // Try to get sender name from user, bot_profile, username, or bot_id
-                    let sender_name = if let Some(ref user_id) = slack_msg.user {
-                        name_cache
-                            .get(user_id)
-                            .cloned()
-                            .unwrap_or_else(|| user_id.clone())
-                    } else if let Some(ref bot_profile) = slack_msg.bot_profile {
-                        // For Slack apps/webhooks, bot_profile.name contains the display name
-                        bot_profile.name.clone().unwrap_or_else(|| "Bot".to_string())
-                    } else if let Some(ref username) = slack_msg.username {
-                        // Fallback to username field
-                        username.clone()
-                    } else if let Some(ref bot_id) = slack_msg.bot_id {
-                        // Fallback to bot_id lookup
-                        name_cache
-                            .get(bot_id)
-                            .cloned()
-                            .unwrap_or_else(|| bot_id.clone())
-                    } else {
-                        "Unknown".to_string()
-                    };
-                    let reactions: Vec<(String, u32)> = slack_msg
-                        .reactions
-                        .iter()
-                        .map(|r| (r.name.clone(), r.count))
-                        .collect();
-                    let mentions_me = Self::message_mentions_user(&slack_msg.text, &self.my_user_id);
-                    let (media_type, file_ids, file_urls, file_names) = detect_media_type(&slack_msg.files)
-                        .map(|(mt, ids, urls, names)| (Some(mt), ids, urls, names))
-                        .unwrap_or((None, Vec::new(), Vec::new(), Vec::new()));
-                    let msg_data = crate::widgets::MessageData {
-                        sender_name,
-                        text: slack_msg.text.clone(),
-                        is_outgoing: slack_msg.user.as_deref() == Some(&self.my_user_id),
-                        ts: slack_msg.ts.clone(),
-                        reactions,
-                        reply_count: slack_msg.reply_count.unwrap_or(0),
-                        forwarded_text: forwarded_preview(&slack_msg.attachments),
-                        mentions_me,
-                        local_echo_id: None,
-                            is_edited: false,
-                            is_deleted: false,
-                            media_type,
-                            file_ids,
-                            file_urls,
-                            file_names,
-                        };
-                        pane.msg_data.push(msg_data);
-                }
+                Ok(OpenChatLoadResult {
+                    pane_idx,
+                    channel_id: channel_id.clone(),
+                    messages,
+                    name_cache,
+                })
             }
-            Err(e) => {
-                self.set_status(&format!("Failed to load messages: {}", e));
-            }
-        }
+            .await;
 
-        // Sync user name cache
-        self.user_name_cache = self.slack.get_user_name_cache().await;
+            let _ = tx.send(result);
+        });
 
-        // Auto-scroll to bottom
-        self.panes[self.focused_pane_idx].scroll_offset = usize::MAX;
+        self.pending_open_chat_load = Some(rx);
+        self.set_status(&format!("Loading {}...", chat.name));
+        self.needs_redraw = true;
         self.focus_on_chat_list = false;
         Ok(())
     }
@@ -1190,39 +1013,10 @@ impl App {
         thread_pane.chat_name = format!("Thread: {}", parent_user);
         self.panes.push(thread_pane);
 
-        // Check if the focused pane is already a thread
-        let focused_pane = &self.panes[self.focused_pane_idx];
-        let is_already_thread = focused_pane.thread_ts.is_some();
-        
-        // Check if there are any existing thread panes open
-        let existing_thread_pane_idx = self.panes.iter()
-            .enumerate()
-            .find(|(_, p)| p.thread_ts.is_some())
-            .map(|(idx, _)| idx);
-        
-        if is_already_thread {
-            // If we're already in a thread view, split the focused thread pane horizontally
-            // This will create a horizontal split within the thread area
-            if !self.pane_tree.split_pane_with_ratio(self.focused_pane_idx, SplitDirection::Horizontal, new_idx, 50) {
-                // If split failed (e.g., pane is deeply nested), try fallback
-                // Fallback: split root horizontally (less ideal but should work)
-                self.pane_tree.split_with_ratio(SplitDirection::Horizontal, new_idx, 50);
-            }
-        } else if let Some(thread_pane_idx) = existing_thread_pane_idx {
-            // If we're in a regular channel but there's already a thread open,
-            // split that existing thread pane horizontally (new thread goes under it)
-            if !self.pane_tree.split_pane_with_ratio(thread_pane_idx, SplitDirection::Horizontal, new_idx, 50) {
-                // Fallback: try splitting the focused pane vertically
-                if !self.pane_tree.split_pane_with_ratio(self.focused_pane_idx, SplitDirection::Vertical, new_idx, 33) {
-                    self.pane_tree.split_with_ratio(SplitDirection::Vertical, new_idx, 33);
-                }
-            }
-        } else {
-            // If we're in a regular channel and no threads are open, split vertically (thread takes 1/3)
-            if !self.pane_tree.split_pane_with_ratio(self.focused_pane_idx, SplitDirection::Vertical, new_idx, 33) {
-                // Fallback if split failed
-                self.pane_tree.split_with_ratio(SplitDirection::Vertical, new_idx, 33);
-            }
+        // Always split the focused pane horizontally so the thread opens
+        // in a new pane stacked under the current one (no side pane).
+        if !self.pane_tree.split_pane_with_ratio(self.focused_pane_idx, SplitDirection::Horizontal, new_idx, 50) {
+            self.pane_tree.split_with_ratio(SplitDirection::Horizontal, new_idx, 50);
         }
         
         // Focus the new thread pane
@@ -1449,6 +1243,8 @@ impl App {
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
+        let has_status = self.status_message.is_some();
+        
         // Check if we have mentions in other workspaces
         let current_workspace_name = self.config.workspaces
             .get(self.config.active_workspace)
@@ -1460,8 +1256,12 @@ impl App {
             .map(|(name, count)| (name.clone(), *count))
             .collect();
         let has_other_mentions = !other_workspace_mentions.is_empty();
-
-        let main_constraints = if has_other_mentions {
+        
+        let main_constraints = if has_status && has_other_mentions {
+            vec![Constraint::Min(0), Constraint::Length(1), Constraint::Length(1)]
+        } else if has_status {
+            vec![Constraint::Min(0), Constraint::Length(1)]
+        } else if has_other_mentions {
             vec![Constraint::Min(0), Constraint::Length(1)]
         } else {
             vec![Constraint::Min(0)]
@@ -1480,6 +1280,7 @@ impl App {
                     let emoji = match c.section {
                         ChatSection::Public => "# ",
                         ChatSection::Private => "🔒 ",
+                        ChatSection::Shared => "🔗 ",
                         ChatSection::DirectMessage => "👤 ",
                         ChatSection::Group => "👥 ",
                         ChatSection::Bot => "🤖 ",
@@ -1489,8 +1290,8 @@ impl App {
                 .max()
                 .unwrap_or(20);
             
-            // Add padding for borders and some breathing room (narrower: ~2/3 of before)
-            let chat_list_width = (max_name_len + 4).min(27).max(10) as u16;
+            // Add padding for borders and some breathing room
+            let chat_list_width = (max_name_len + 6).min(40).max(15) as u16;
             
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
@@ -1534,7 +1335,16 @@ impl App {
             let notification = Paragraph::new(format!(" Mentions in other workspaces: {} (Ctrl+N to switch)", mention_text))
                 .style(Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
                 .block(Block::default());
-            f.render_widget(notification, outer[outer.len() - 1]);
+            let notification_idx = if has_status { outer.len() - 2 } else { outer.len() - 1 };
+            f.render_widget(notification, outer[notification_idx]);
+        }
+
+        // Draw status bar
+        if has_status {
+            let status = Paragraph::new(self.status_message.as_ref().unwrap().clone())
+                .style(Style::default().bg(Color::DarkGray).fg(Color::White))
+                .block(Block::default());
+            f.render_widget(status, outer[outer.len() - 1]);
         }
     }
 
@@ -1543,6 +1353,7 @@ impl App {
         let sections = [
             ChatSection::Public,
             ChatSection::Private,
+            ChatSection::Shared,
             ChatSection::Group,
             ChatSection::DirectMessage,
             ChatSection::Bot,
@@ -1559,9 +1370,13 @@ impl App {
             .map(|(i, _)| i)
             .collect();
         if !new_chats.is_empty() {
-            rows.push(ChatListRow::Header("New".to_string()));
-            for idx in new_chats {
-                rows.push(ChatListRow::Chat(idx));
+            let label = "New".to_string();
+            let collapsed = self.collapsed_sections.contains(&label);
+            rows.push(ChatListRow::Header(label));
+            if !collapsed {
+                for idx in new_chats {
+                    rows.push(ChatListRow::Chat(idx));
+                }
             }
         }
 
@@ -1579,12 +1394,55 @@ impl App {
                 continue;
             }
 
-            rows.push(ChatListRow::Header(section.label().to_string()));
-            for idx in section_chats {
-                rows.push(ChatListRow::Chat(idx));
+            let label = section.label().to_string();
+            let collapsed = self.collapsed_sections.contains(&label);
+            rows.push(ChatListRow::Header(label));
+            if !collapsed {
+                for idx in section_chats {
+                    rows.push(ChatListRow::Chat(idx));
+                }
             }
         }
         rows
+    }
+
+    /// Toggle a section's collapsed state. Returns true if a section was toggled.
+    pub fn toggle_section(&mut self, label: &str) -> bool {
+        if self.collapsed_sections.contains(label) {
+            self.collapsed_sections.remove(label);
+        } else {
+            self.collapsed_sections.insert(label.to_string());
+        }
+        self.needs_redraw = true;
+        true
+    }
+
+    /// Toggle the section at the currently-selected row (if it is a header).
+    /// Returns true if a header was toggled.
+    pub fn toggle_selected_section(&mut self) -> bool {
+        let rows = self.build_chat_list_rows();
+        // Find the header row that owns the currently-selected logical chat,
+        // OR if the user navigated past chats and the selection is on a
+        // header row (header rows have no chat index, so we search by
+        // chat_list_scroll_offset position).
+        // We expose toggling via a dedicated path: try to find a header
+        // matching the selection by visual row.
+        // Simpler: toggle the section that the selected chat belongs to.
+        if let Some(chat) = self.chats.get(self.selected_chat_idx) {
+            let label = if chat.unread > 0 {
+                "New".to_string()
+            } else {
+                chat.section.label().to_string()
+            };
+            // Only toggle if that label currently has a header rendered
+            if rows
+                .iter()
+                .any(|r| matches!(r, ChatListRow::Header(l) if l == &label))
+            {
+                return self.toggle_section(&label);
+            }
+        }
+        false
     }
 
     /// Find the display row index for a given chat index.
@@ -1592,14 +1450,6 @@ impl App {
         rows.iter()
             .position(|r| matches!(r, ChatListRow::Chat(idx) if *idx == chat_idx))
             .unwrap_or(0)
-    }
-
-    /// Find the chat index from a display row click.
-    fn row_to_chat_idx(rows: &[ChatListRow], row: usize) -> Option<usize> {
-        rows.get(row).and_then(|r| match r {
-            ChatListRow::Chat(idx) => Some(*idx),
-            _ => None,
-        })
     }
 
     fn draw_chat_list(&mut self, f: &mut Frame, area: Rect) {
@@ -1624,44 +1474,57 @@ impl App {
             .skip(self.chat_list_scroll_offset)
             .take(visible_height)
             .map(|(_, row)| match row {
-                ChatListRow::Header(label) => ListItem::new(Line::from(Span::styled(
-                    format!("-- {} --", label),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                ))),
+                ChatListRow::Header(label) => {
+                    let collapsed = self.collapsed_sections.contains(label);
+                    let marker = if collapsed { ">" } else { "v" };
+                    ListItem::new(Line::from(Span::styled(
+                        format!("{} {}", marker, label),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )))
+                }
                 ChatListRow::Chat(chat_idx) => {
                     let chat = &self.chats[*chat_idx];
-                    let mut style = if *chat_idx == self.selected_chat_idx {
+                    let is_selected = *chat_idx == self.selected_chat_idx;
+                    let has_activity = chat.unread > 0;
+
+                    let base_style = if is_selected {
                         Style::default().bg(Color::Blue).fg(Color::White)
-                    } else if chat.unread > 0 {
-                        Style::default().fg(Color::Red)
+                    } else if has_activity {
+                        Style::default()
+                            .fg(Color::LightYellow)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
                     };
 
-                    if chat.unread > 0 && *chat_idx == self.selected_chat_idx {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
-
-                    let unread_marker = if chat.unread > 0 {
-                        format!(" ({})", chat.unread)
+                    let marker_style = if is_selected {
+                        Style::default()
+                            .bg(Color::Blue)
+                            .fg(Color::LightYellow)
+                            .add_modifier(Modifier::BOLD)
                     } else {
-                        String::new()
+                        Style::default()
+                            .fg(Color::LightYellow)
+                            .add_modifier(Modifier::BOLD)
                     };
 
                     let mut spans = vec![];
-                    if chat.unread > 0 {
-                        spans.push(Span::styled(
-                            "! ",
-                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                        ));
+                    if has_activity {
+                        spans.push(Span::styled("● ", marker_style));
                     } else {
                         spans.push(Span::raw("  "));
                     }
-                    spans.push(Span::raw(format!("{}{}", chat.name, unread_marker)));
+                    spans.push(Span::styled(chat.name.clone(), base_style));
+                    if has_activity {
+                        spans.push(Span::styled(
+                            format!(" ({})", chat.unread),
+                            marker_style,
+                        ));
+                    }
 
-                    ListItem::new(Line::from(spans)).style(style)
+                    ListItem::new(Line::from(spans)).style(base_style)
                 }
             })
             .collect();
@@ -1731,9 +1594,6 @@ impl App {
             header_text.push_str("[TARGET] ");
         }
         header_text.push_str(&pane.header_text());
-        if is_focused {
-            header_text.push_str(&self.realtime_status_text());
-        }
 
         let header = Paragraph::new(header_text)
             .block(if self.show_borders {
@@ -1758,7 +1618,6 @@ impl App {
         let show_line_numbers = self.show_line_numbers;
         let show_timestamps = self.show_timestamps;
         let show_user_colors = self.show_user_colors;
-        let highlight_words = &self.highlight_words;
         let user_cache = &self.user_name_cache;
         let resolve_user = |id: &str| -> String {
             user_cache
@@ -1777,6 +1636,7 @@ impl App {
 
         // Messages with emojis, reactions, and thread indicators
         let mut message_lines: Vec<Line> = Vec::new();
+        let mut image_overlays: Vec<(usize, String, String)> = Vec::new();
         for (idx, msg) in pane.msg_data.iter().enumerate() {
             let name_style = if msg.is_outgoing {
                 Style::default()
@@ -1841,7 +1701,8 @@ impl App {
                 username_style,
             ));
 
-            let mut content_spans = highlight_spans(&formatted_text, highlight_words);
+            let mut content_spans = Vec::new();
+            content_spans.push(Span::raw(formatted_text));
 
             // Add media indicator
             if let Some(ref media_type) = msg.media_type {
@@ -1902,34 +1763,20 @@ impl App {
             }
 
             let prefix_width = spans_width(&prefix_spans);
-            let (first_width, rest_width, indent_str) = if msg.is_outgoing {
-                (msg_width.saturating_sub(prefix_width), msg_width, String::new())
-            } else {
-                let indent = " ".repeat(prefix_width);
-                let indent_width = UnicodeWidthStr::width(indent.as_str());
-                (
-                    msg_width.saturating_sub(prefix_width),
-                    msg_width.saturating_sub(indent_width),
-                    indent,
-                )
-            };
+            let indent = " ".repeat(prefix_width);
+            let indent_width = UnicodeWidthStr::width(indent.as_str());
+            let first_width = msg_width.saturating_sub(prefix_width);
+            let rest_width = msg_width.saturating_sub(indent_width);
             let mut wrapped =
-                wrap_spans_hanging(&content_spans, first_width, rest_width, indent_str.as_str());
+                wrap_spans_hanging(&content_spans, first_width, rest_width, indent.as_str());
             if wrapped.is_empty() {
                 wrapped.push(Vec::new());
             }
             let mut first_line = prefix_spans;
             first_line.extend(wrapped.remove(0));
-            if msg.is_outgoing {
-                message_lines.push(Line::from(first_line).alignment(ratatui::layout::Alignment::Right));
-                for line in wrapped {
-                    message_lines.push(Line::from(line).alignment(ratatui::layout::Alignment::Right));
-                }
-            } else {
-                message_lines.push(Line::from(first_line));
-                for line in wrapped {
-                    message_lines.push(Line::from(line));
-                }
+            message_lines.push(Line::from(first_line));
+            for line in wrapped {
+                message_lines.push(Line::from(line));
             }
 
             // Show quoted/forwarded message as indented block (max 3 lines)
@@ -1964,6 +1811,17 @@ impl App {
                     message_lines.push(Line::from(line));
                 }
             }
+
+            // Reserve 8 rows for inline image preview if this message has an image attachment.
+            if self.show_image_preview && msg.media_type.as_deref() == Some("image") && !msg.file_urls.is_empty() {
+                let url = msg.file_urls[0].clone();
+                let name = msg.file_names.first().cloned().unwrap_or_else(|| "image".to_string());
+                let abs_line = message_lines.len();
+                for _ in 0..8 {
+                    message_lines.push(Line::default());
+                }
+                image_overlays.push((abs_line, url, name));
+            }
         }
 
         let messages = Paragraph::new(message_lines)
@@ -1972,7 +1830,7 @@ impl App {
         // Use ratatui's own line_count with inner width for accurate wrapping
         // line_count adds vertical space back, so subtract it to get content lines only
         let vertical_space = if self.show_borders { 2u16 } else { 0u16 };
-        let total_wrapped_lines = messages.line_count(chunks[1].width)
+        let total_wrapped_lines = messages.line_count(msg_inner.width)
             .saturating_sub(vertical_space as usize);
         let max_scroll = total_wrapped_lines.saturating_sub(msg_area_height);
         let scroll_offset = pane.scroll_offset.min(max_scroll);
@@ -1980,6 +1838,68 @@ impl App {
         let messages = messages.scroll((scroll_offset as u16, 0));
 
         f.render_widget(messages, chunks[1]);
+
+        // Inline image overlays — only spawn loads / render images for visible viewport.
+        if !image_overlays.is_empty() {
+            let viewport_h = msg_inner.height as i32;
+            let scroll = scroll_offset as i32;
+            for (abs_line, url, name) in &image_overlays {
+                let rel_top = *abs_line as i32 - scroll;
+                let rel_bot = rel_top + 8;
+                if rel_bot <= 0 || rel_top >= viewport_h {
+                    continue;
+                }
+                let clip_top = rel_top.max(0);
+                let clip_bot = rel_bot.min(viewport_h);
+                let h = (clip_bot - clip_top) as u16;
+                if h == 0 || msg_inner.width == 0 {
+                    continue;
+                }
+                let rect = Rect {
+                    x: msg_inner.x,
+                    y: msg_inner.y + clip_top as u16,
+                    width: msg_inner.width,
+                    height: h,
+                };
+
+                if self.image_picker.is_none() {
+                    let p = Paragraph::new(format!("[image: {}]", name))
+                        .style(Style::default().fg(Color::DarkGray));
+                    f.render_widget(p, rect);
+                    continue;
+                }
+
+                // Trigger a load if we've never seen this URL.
+                let needs_load = !self.image_cache.borrow().contains_key(url);
+                if needs_load {
+                    self.image_cache
+                        .borrow_mut()
+                        .insert(url.clone(), ImageCacheEntry::Loading);
+                    self.spawn_image_load(url.clone(), name.clone());
+                }
+
+                let mut cache = self.image_cache.borrow_mut();
+                match cache.get_mut(url) {
+                    Some(ImageCacheEntry::Loading) => {
+                        let p = Paragraph::new("[loading image...]")
+                            .style(Style::default().fg(Color::DarkGray));
+                        f.render_widget(p, rect);
+                    }
+                    Some(ImageCacheEntry::Failed(msg)) => {
+                        let p = Paragraph::new(format!("[image failed: {}]", msg))
+                            .style(Style::default().fg(Color::Red));
+                        f.render_widget(p, rect);
+                    }
+                    Some(ImageCacheEntry::Loaded(proto)) => {
+                        use ratatui::widgets::StatefulWidget;
+                        let img_widget =
+                            ratatui_image::StatefulImage::<ratatui_image::protocol::StatefulProtocol>::default();
+                        StatefulWidget::render(img_widget, rect, f.buffer_mut(), proto);
+                    }
+                    None => {}
+                }
+            }
+        }
 
         // Reply preview if present
         if has_reply_preview {
@@ -2037,11 +1957,28 @@ impl App {
         }
     }
 
-    pub fn set_status(&mut self, _message: &str) {
-        // Status bar removed; messages are silently discarded
+    pub fn set_status(&mut self, message: &str) {
+        self.status_message = Some(message.to_string());
+        self.status_expire = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        self.needs_redraw = true;
     }
 
     pub fn save_state(&self) -> Result<()> {
+        let current_workspace_name = self
+            .config
+            .workspaces
+            .get(self.config.active_workspace)
+            .map(|w| w.name.clone())
+            .unwrap_or_default();
+        let mut workspace_unread_counts = self.workspace_unread_cache.clone();
+        workspace_unread_counts.insert(
+            current_workspace_name,
+            self.chats
+                .iter()
+                .map(|c| (c.id.clone(), c.unread))
+                .collect(),
+        );
+
         let state = AppState {
             settings: crate::persistence::AppSettings {
                 show_reactions: self.show_reactions,
@@ -2054,7 +1991,8 @@ impl App {
                 show_user_colors: self.show_user_colors,
                 show_borders: self.show_borders,
                 mouse_support: self.mouse_support,
-                highlight_words: self.highlight_words.clone(),
+                show_image_preview: self.show_image_preview,
+                collapsed_sections: self.collapsed_sections.iter().cloned().collect(),
             },
             aliases: self.aliases.clone(),
             layout: LayoutData {
@@ -2074,22 +2012,47 @@ impl App {
                 focused_pane: self.focused_pane_idx,
                 pane_tree: Some(self.pane_tree.clone()),
             },
+            workspace_unread_counts,
         };
 
         state.save(&self.config)
     }
 
-    // Navigation methods
+    // Navigation methods. These walk the visible (non-collapsed) chat rows.
+    fn visible_chat_indices(&self) -> Vec<usize> {
+        self.build_chat_list_rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                ChatListRow::Chat(idx) => Some(idx),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn select_next_chat(&mut self) {
-        if !self.chats.is_empty() {
-            self.selected_chat_idx = (self.selected_chat_idx + 1).min(self.chats.len() - 1);
+        let visible = self.visible_chat_indices();
+        if visible.is_empty() {
+            return;
         }
+        let pos = visible
+            .iter()
+            .position(|&i| i == self.selected_chat_idx)
+            .unwrap_or(0);
+        let next = (pos + 1).min(visible.len() - 1);
+        self.selected_chat_idx = visible[next];
     }
 
     pub fn select_previous_chat(&mut self) {
-        if !self.chats.is_empty() {
-            self.selected_chat_idx = self.selected_chat_idx.saturating_sub(1);
+        let visible = self.visible_chat_indices();
+        if visible.is_empty() {
+            return;
         }
+        let pos = visible
+            .iter()
+            .position(|&i| i == self.selected_chat_idx)
+            .unwrap_or(0);
+        let prev = pos.saturating_sub(1);
+        self.selected_chat_idx = visible[prev];
     }
 
     pub fn next_pane(&mut self) {
@@ -2471,6 +2434,20 @@ impl App {
         self.needs_redraw = true;
     }
 
+    pub fn toggle_image_preview(&mut self) {
+        self.show_image_preview = !self.show_image_preview;
+        let status = if self.show_image_preview {
+            "Image preview: ON"
+        } else {
+            "Image preview: OFF"
+        };
+        self.set_status(status);
+        for pane in &mut self.panes {
+            pane.invalidate_cache();
+        }
+        self.needs_redraw = true;
+    }
+
     pub fn toggle_timestamps(&mut self) {
         self.show_timestamps = !self.show_timestamps;
         for pane in &mut self.panes {
@@ -2528,9 +2505,16 @@ impl App {
                 let relative_y = y.saturating_sub(area.y + border_offset);
                 let row_idx = relative_y as usize + self.chat_list_scroll_offset;
                 let rows = self.build_chat_list_rows();
-                if let Some(chat_idx) = Self::row_to_chat_idx(&rows, row_idx) {
-                    self.selected_chat_idx = chat_idx;
-                    self.pending_open_chat = true;
+                match rows.get(row_idx) {
+                    Some(ChatListRow::Header(label)) => {
+                        let label = label.clone();
+                        self.toggle_section(&label);
+                    }
+                    Some(ChatListRow::Chat(chat_idx)) => {
+                        self.selected_chat_idx = *chat_idx;
+                        self.pending_open_chat = true;
+                    }
+                    None => {}
                 }
                 return;
             }
@@ -2594,10 +2578,12 @@ impl App {
                 show_user_colors: self.show_user_colors,
                 show_borders: self.show_borders,
                 mouse_support: self.mouse_support,
-                highlight_words: self.highlight_words.clone(),
+                show_image_preview: self.show_image_preview,
+                collapsed_sections: self.collapsed_sections.iter().cloned().collect(),
             },
             aliases: self.aliases.clone(),
             layout: LayoutData::default(),
+            workspace_unread_counts: std::collections::HashMap::new(),
         });
 
         // Restore pane tree
@@ -2671,12 +2657,6 @@ impl App {
             Ok(Ok((slack, my_user_id))) => {
                 self.slack = slack;
                 self.my_user_id = my_user_id;
-                self.app_start_instant = std::time::Instant::now();
-                self.last_realtime_event_instant = None;
-                self.last_realtime_event_at = None;
-                self.last_fallback_refresh_instant = std::time::Instant::now();
-                self.last_fallback_refresh_at = None;
-                self.realtime_was_stale = false;
                 self.pending_workspace_switch = None;
                 self.pending_refresh_chats = true;
                 self.pending_reload_panes = true;
@@ -2693,6 +2673,150 @@ impl App {
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                 self.pending_workspace_switch = None;
                 self.set_status("Workspace switch failed: task dropped");
+                false
+            }
+        }
+    }
+
+    /// Drain any completed image loads and update the cache. Returns true if changed.
+    pub fn poll_image_loads(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            match self.image_load_rx.try_recv() {
+                Ok((url, result)) => {
+                    let mut cache = self.image_cache.borrow_mut();
+                    match result {
+                        Ok(dyn_img) => {
+                            if let Some(picker) = self.image_picker.as_ref() {
+                                let proto = picker.new_resize_protocol(dyn_img);
+                                cache.insert(url, ImageCacheEntry::Loaded(proto));
+                            } else {
+                                cache.insert(url, ImageCacheEntry::Failed("no picker".into()));
+                            }
+                        }
+                        Err(e) => {
+                            cache.insert(url, ImageCacheEntry::Failed(e));
+                        }
+                    }
+                    changed = true;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        changed
+    }
+
+    /// Spawn an async task to download + decode an image and feed result back via channel.
+    fn spawn_image_load(&self, url: String, name: String) {
+        let slack = self.slack.clone();
+        let tx = self.image_load_tx.clone();
+        tokio::spawn(async move {
+            let res: std::result::Result<image::DynamicImage, String> =
+                match slack.download_file_from_url(&url, &name).await {
+                    Ok(path) => match image::open(&path) {
+                        Ok(img) => Ok(img),
+                        Err(e) => Err(format!("decode: {e}")),
+                    },
+                    Err(e) => Err(format!("download: {e}")),
+                };
+            let _ = tx.send((url, res));
+        });
+    }
+
+    /// Called from the event loop to check if an async chat-load completed.
+    pub fn poll_open_chat_load(&mut self) -> bool {
+        let rx = match self.pending_open_chat_load.as_mut() {
+            Some(rx) => rx,
+            None => return false,
+        };
+
+        match rx.try_recv() {
+            Ok(Ok(load)) => {
+                self.pending_open_chat_load = None;
+
+                if load.pane_idx >= self.panes.len() {
+                    return false;
+                }
+
+                let loaded_chat_name = {
+                    let pane = &mut self.panes[load.pane_idx];
+                    if pane.channel_id_str.as_deref() != Some(load.channel_id.as_str()) {
+                        // Stale result after the user switched panes/channels again.
+                        return false;
+                    }
+
+                    pane.msg_data.clear();
+                    for slack_msg in load.messages.iter().rev() {
+                        let sender_name = if let Some(ref user_id) = slack_msg.user {
+                            load.name_cache
+                                .get(user_id)
+                                .cloned()
+                                .unwrap_or_else(|| user_id.clone())
+                        } else if let Some(ref bot_profile) = slack_msg.bot_profile {
+                            bot_profile.name.clone().unwrap_or_else(|| "Bot".to_string())
+                        } else if let Some(ref username) = slack_msg.username {
+                            username.clone()
+                        } else if let Some(ref bot_id) = slack_msg.bot_id {
+                            load.name_cache
+                                .get(bot_id)
+                                .cloned()
+                                .unwrap_or_else(|| bot_id.clone())
+                        } else {
+                            "Unknown".to_string()
+                        };
+
+                        let reactions: Vec<(String, u32)> = slack_msg
+                            .reactions
+                            .iter()
+                            .map(|r| (r.name.clone(), r.count))
+                            .collect();
+                        let mentions_me =
+                            Self::message_mentions_user(&slack_msg.text, &self.my_user_id);
+                        let (media_type, file_ids, file_urls, file_names) =
+                            detect_media_type(&slack_msg.files)
+                                .map(|(mt, ids, urls, names)| (Some(mt), ids, urls, names))
+                                .unwrap_or((None, Vec::new(), Vec::new(), Vec::new()));
+
+                        pane.msg_data.push(crate::widgets::MessageData {
+                            sender_name,
+                            text: slack_msg.text.clone(),
+                            is_outgoing: slack_msg.user.as_deref() == Some(&self.my_user_id),
+                            ts: slack_msg.ts.clone(),
+                            reactions,
+                            reply_count: slack_msg.reply_count.unwrap_or(0),
+                            forwarded_text: forwarded_preview(&slack_msg.attachments),
+                            mentions_me,
+                            local_echo_id: None,
+                            is_edited: false,
+                            is_deleted: false,
+                            media_type,
+                            file_ids,
+                            file_urls,
+                            file_names,
+                        });
+                    }
+
+                    pane.invalidate_cache();
+                    pane.scroll_offset = usize::MAX;
+                    pane.chat_name.clone()
+                };
+                self.user_name_cache = load.name_cache;
+                self.needs_redraw = true;
+                self.set_status(&format!("Loaded {}", loaded_chat_name));
+                true
+            }
+            Ok(Err(e)) => {
+                self.pending_open_chat_load = None;
+                self.set_status(&format!("Failed to load messages: {}", e));
+                self.needs_redraw = true;
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.pending_open_chat_load = None;
+                self.set_status("Failed to load messages: task dropped");
+                self.needs_redraw = true;
                 false
             }
         }
@@ -2730,66 +2854,6 @@ impl App {
             self.focused_pane_idx = self.panes.len() - 1;
         }
     }
-}
-
-/// Split `text` into styled spans, highlighting any occurrence of words in `highlight_words`
-/// with red bold text (case-insensitive). Returns plain spans if no words match.
-fn highlight_spans(text: &str, highlight_words: &[String]) -> Vec<Span<'static>> {
-    if highlight_words.is_empty() {
-        return vec![Span::raw(text.to_string())];
-    }
-
-    let text_lower = text.to_lowercase();
-    // Collect all match intervals [start, end) in byte positions
-    let mut intervals: Vec<(usize, usize)> = Vec::new();
-    for word in highlight_words {
-        if word.is_empty() {
-            continue;
-        }
-        let word_lower = word.to_lowercase();
-        let mut search_from = 0;
-        while let Some(pos) = text_lower[search_from..].find(word_lower.as_str()) {
-            let abs_start = search_from + pos;
-            let abs_end = abs_start + word.len();
-            intervals.push((abs_start, abs_end));
-            search_from = abs_start + 1;
-        }
-    }
-
-    if intervals.is_empty() {
-        return vec![Span::raw(text.to_string())];
-    }
-
-    // Sort and merge overlapping intervals
-    intervals.sort_by_key(|&(s, _)| s);
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for (start, end) in intervals {
-        if let Some(last) = merged.last_mut() {
-            if start < last.1 {
-                last.1 = last.1.max(end);
-                continue;
-            }
-        }
-        merged.push((start, end));
-    }
-
-    let highlight_style = Style::default()
-        .fg(Color::Red)
-        .add_modifier(Modifier::BOLD);
-
-    let mut spans = Vec::new();
-    let mut cursor = 0;
-    for (start, end) in merged {
-        if cursor < start {
-            spans.push(Span::raw(text[cursor..start].to_string()));
-        }
-        spans.push(Span::styled(text[start..end].to_string(), highlight_style));
-        cursor = end;
-    }
-    if cursor < text.len() {
-        spans.push(Span::raw(text[cursor..].to_string()));
-    }
-    spans
 }
 
 fn spans_width(spans: &[Span]) -> usize {

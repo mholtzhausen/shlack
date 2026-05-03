@@ -1,10 +1,9 @@
 use anyhow::{anyhow, Result};
 use futures::{SinkExt, StreamExt};
-use regex::Regex;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -51,6 +50,7 @@ pub struct SlackClient {
     ws_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     ws_shutdown: Arc<Mutex<Option<broadcast::Sender<()>>>>,
     user_name_cache: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    user_info_cache: Arc<Mutex<std::collections::HashMap<String, CachedUserInfo>>>,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +66,8 @@ struct AuthTestResponse {
 struct ConversationsListResponse {
     ok: bool,
     channels: Vec<Channel>,
+    #[serde(default)]
+    response_metadata: Option<ResponseMetadata>,
 }
 
 #[derive(Deserialize)]
@@ -86,7 +88,14 @@ struct Channel {
     #[serde(default)]
     is_archived: bool,
     #[serde(default)]
+    #[allow(dead_code)]
     is_member: bool,
+    #[serde(default)]
+    is_shared: bool,
+    #[serde(default)]
+    is_ext_shared: bool,
+    #[serde(default)]
+    is_org_shared: bool,
     #[serde(default)]
     unread_count: Option<u32>,
 }
@@ -257,6 +266,13 @@ struct User {
     deleted: bool,
 }
 
+#[derive(Clone)]
+struct CachedUserInfo {
+    name: String,
+    is_bot: bool,
+    deleted: bool,
+}
+
 #[derive(Deserialize)]
 struct SocketModeConnectResponse {
     ok: bool,
@@ -276,6 +292,7 @@ impl SlackClient {
             ws_handle: Arc::new(Mutex::new(None)),
             ws_shutdown: Arc::new(Mutex::new(None)),
             user_name_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            user_info_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
         };
 
         // Test authentication
@@ -313,18 +330,18 @@ impl SlackClient {
                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
                 writeln!(f, "[{}] start_event_listener called", timestamp)
             });
-
+        
         let pending_updates = self.pending_updates.clone();
         let http = self.http.clone();
         let token = self.token.clone();
         let user_id = self.user_id.clone();
+        let user_name_cache = self.user_name_cache.clone();
+        let user_info_cache = self.user_info_cache.clone();
+        let app_token = app_token.clone();
 
         // Create shutdown channel
         let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
         *self.ws_shutdown.lock().await = Some(shutdown_tx);
-
-        // Channel for proactive reconnection (when approximate_connection_time elapses)
-        let (proactive_tx, mut proactive_rx) = mpsc::channel::<()>(1);
 
         let handle = tokio::spawn(async move {
             let log_to_file = |msg: &str| {
@@ -338,14 +355,19 @@ impl SlackClient {
                 }
             };
 
-            let envelope_id_regex = Regex::new(r#""envelope_id"\s*:\s*"([^"]+)""#).expect("valid regex");
-
             log_to_file("WebSocket task starting...");
 
-            // Reconnection loop
+            let mut backoff_secs: u64 = 1;
+
             'reconnect: loop {
-                // Get fresh WebSocket URL (Slack rotates these periodically)
-                let ws_url = match http
+                // Bail out early if shutdown was requested between reconnects
+                if shutdown_rx.try_recv().is_ok() {
+                    log_to_file("Shutdown requested before reconnect, exiting");
+                    break 'reconnect;
+                }
+
+                // Fetch a fresh socket URL on every (re)connect; URLs are single-use
+                let url = match http
                     .post("https://slack.com/api/apps.connections.open")
                     .bearer_auth(&app_token)
                     .send()
@@ -355,129 +377,144 @@ impl SlackClient {
                         Ok(r) if r.ok => r.url,
                         Ok(_) => {
                             log_to_file("apps.connections.open returned ok=false");
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            continue 'reconnect;
+                            tokio::select! {
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                                _ = shutdown_rx.recv() => break 'reconnect,
+                            }
+                            backoff_secs = (backoff_secs * 2).min(60);
+                            continue;
                         }
                         Err(e) => {
-                            log_to_file(&format!("apps.connections.open parse error: {}", e));
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            continue 'reconnect;
+                            log_to_file(&format!("Failed to parse connect response: {}", e));
+                            tokio::select! {
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                                _ = shutdown_rx.recv() => break 'reconnect,
+                            }
+                            backoff_secs = (backoff_secs * 2).min(60);
+                            continue;
                         }
                     },
                     Err(e) => {
                         log_to_file(&format!("apps.connections.open request failed: {}", e));
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        continue 'reconnect;
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                            _ = shutdown_rx.recv() => break 'reconnect,
+                        }
+                        backoff_secs = (backoff_secs * 2).min(60);
+                        continue;
                     }
                 };
 
-                let (mut ws_stream, _) = match connect_async(&ws_url).await {
-                    Ok(conn) => conn,
+                let mut ws_stream = match connect_async(&url).await {
+                    Ok((s, _)) => {
+                        log_to_file("WebSocket connected successfully");
+                        backoff_secs = 1;
+                        s
+                    }
                     Err(e) => {
-                        log_to_file(&format!("WebSocket connect failed: {}", e));
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        continue 'reconnect;
+                        log_to_file(&format!("Failed to connect WebSocket: {}", e));
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                            _ = shutdown_rx.recv() => break 'reconnect,
+                        }
+                        backoff_secs = (backoff_secs * 2).min(60);
+                        continue;
                     }
                 };
 
-                log_to_file("WebSocket connected successfully");
-
-                // Process messages until disconnect, stream end, or shutdown
                 loop {
                     tokio::select! {
-                        biased;
-
-                        _ = shutdown_rx.recv() => {
-                            log_to_file("Received shutdown signal, closing WebSocket gracefully");
-                            let _ = ws_stream.close(None).await;
-                            break 'reconnect;
-                        }
-
-                        Some(()) = proactive_rx.recv() => {
-                            log_to_file("Proactive reconnect triggered (before connection timeout)");
-                            let _ = ws_stream.close(None).await;
-                            break;
-                        }
-
-                        msg = ws_stream.next() => {
-                            match msg {
+                        next = ws_stream.next() => {
+                            match next {
                                 Some(Ok(Message::Text(text))) => {
                                     log_to_file(&format!("Received WebSocket message: {}", &text[..text.len().min(200)]));
-
-                                    // Robust ack: extract envelope_id even if full parse fails
-                                    let envelope_id = serde_json::from_str::<serde_json::Value>(&text)
-                                        .ok()
-                                        .and_then(|e| e.get("envelope_id").and_then(|v| v.as_str()).map(String::from))
-                                        .or_else(|| {
-                                            envelope_id_regex
-                                                .captures(&text)
-                                                .and_then(|c| c.get(1))
-                                                .map(|m| m.as_str().to_string())
-                                        });
-
-                                    if let Some(ref eid) = envelope_id {
-                                        let ack = serde_json::json!({ "envelope_id": eid });
-                                        let _ = ws_stream.send(Message::Text(ack.to_string())).await;
-                                        log_to_file(&format!("Acknowledged envelope: {}", eid));
-                                    }
-
                                     if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&text) {
-                                        if let Some(event_type) = envelope.get("type").and_then(|v| v.as_str()) {
-                                            log_to_file(&format!("Event type: {}", event_type));
+                                        let env_type = envelope.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-                                            if event_type == "hello" {
-                                                if let Some(debug) = envelope.get("debug_info") {
-                                                    if let Some(secs) = debug.get("approximate_connection_time").and_then(|v| v.as_u64()) {
-                                                        let delay_secs = secs.saturating_sub(100).max(60);
-                                                        let proactive_tx_clone = proactive_tx.clone();
-                                                        tokio::spawn(async move {
-                                                            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                                                            let _ = proactive_tx_clone.send(()).await;
-                                                        });
-                                                        log_to_file(&format!("Scheduled proactive reconnect in {} seconds", delay_secs));
-                                                    }
-                                                }
-                                            } else if event_type == "disconnect" {
-                                                let reason = envelope.get("reason").and_then(|v| v.as_str()).unwrap_or("unknown");
-                                                log_to_file(&format!("Received disconnect (reason: {}), reconnecting", reason));
-                                                let _ = ws_stream.close(None).await;
+                                        // Slack periodically tells the client to reconnect (refresh / warning)
+                                        if env_type == "disconnect" {
+                                            log_to_file("Received disconnect from Slack, reconnecting");
+                                            let _ = ws_stream.close(None).await;
+                                            break;
+                                        }
+
+                                        // Acknowledge envelope
+                                        if let Some(envelope_id) =
+                                            envelope.get("envelope_id").and_then(|v| v.as_str())
+                                        {
+                                            let ack = serde_json::json!({
+                                                "envelope_id": envelope_id
+                                            });
+                                            if let Err(e) = ws_stream.send(Message::Text(ack.to_string())).await {
+                                                log_to_file(&format!(
+                                                    "Failed to acknowledge envelope {}, reconnecting: {}",
+                                                    envelope_id, e
+                                                ));
                                                 break;
-                                            } else if event_type == "events_api" {
-                                                if let Some(event) = envelope.get("payload").and_then(|p| p.get("event")) {
-                                                    log_to_file(&format!("Processing event: {:?}", event));
+                                            }
+                                            log_to_file(&format!("Acknowledged envelope: {}", envelope_id));
+                                        }
+
+                                        log_to_file(&format!("Event type: {}", env_type));
+                                        if env_type == "events_api" {
+                                            if let Some(event) =
+                                                envelope.get("payload").and_then(|p| p.get("event"))
+                                            {
+                                                let event_owned = event.clone();
+                                                let pending_updates = pending_updates.clone();
+                                                let http = http.clone();
+                                                let token = token.clone();
+                                                let user_id = user_id.clone();
+                                                let user_name_cache = user_name_cache.clone();
+                                                let user_info_cache = user_info_cache.clone();
+
+                                                tokio::spawn(async move {
+                                                    log_to_file(&format!("Processing event: {:?}", event_owned));
                                                     Self::process_event(
-                                                        event,
+                                                        &event_owned,
                                                         &pending_updates,
                                                         &http,
                                                         &token,
                                                         &user_id,
+                                                        &user_name_cache,
+                                                        &user_info_cache,
                                                     )
                                                     .await;
                                                     log_to_file("Event processed, added to pending_updates");
-                                                }
+                                                });
                                             }
                                         }
                                     }
                                 }
-                                Some(Ok(Message::Close(_))) => {
-                                    log_to_file("WebSocket received Close frame, reconnecting");
+                                Some(Ok(Message::Ping(p))) => {
+                                    let _ = ws_stream.send(Message::Pong(p)).await;
+                                }
+                                Some(Ok(Message::Close(frame))) => {
+                                    log_to_file(&format!("WebSocket closed by server: {:?}, reconnecting", frame));
                                     break;
                                 }
+                                Some(Ok(_)) => {
+                                    // Pong/Binary/Frame: ignore
+                                }
                                 Some(Err(e)) => {
-                                    log_to_file(&format!("WebSocket stream error: {}", e));
+                                    log_to_file(&format!("WebSocket error: {}, reconnecting", e));
                                     break;
                                 }
                                 None => {
                                     log_to_file("WebSocket stream ended, reconnecting");
                                     break;
                                 }
-                                _ => {}
                             }
+                        }
+                        _ = shutdown_rx.recv() => {
+                            log_to_file("Received shutdown signal, closing WebSocket gracefully");
+                            let _ = ws_stream.close(None).await;
+                            log_to_file("WebSocket closed");
+                            break 'reconnect;
                         }
                     }
                 }
             }
-
             log_to_file("WebSocket task exiting");
         });
 
@@ -491,21 +528,9 @@ impl SlackClient {
         http: &HttpClient,
         token: &str,
         user_id: &Arc<Mutex<Option<String>>>,
+        user_name_cache: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+        user_info_cache: &Arc<Mutex<std::collections::HashMap<String, CachedUserInfo>>>,
     ) {
-        // Local logging function
-        let log_to_file = |msg: &str| {
-            use std::fs::OpenOptions;
-            use std::io::Write;
-            if let Ok(mut file) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/slack_rust_debug.log")
-            {
-                let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-                let _ = writeln!(file, "[{}] {}", timestamp, msg);
-            }
-        };
-
         if let Some(event_type) = event.get("type").and_then(|v| v.as_str()) {
             match event_type {
                 "message" => {
@@ -575,24 +600,29 @@ impl SlackClient {
                         // Check if the message mentions the current user
                         let mentions_me = !my_id.is_empty() && text_mentions_user(text, &my_id);
 
-                        // DEBUG: Log the entire event to see what fields we have
-                        log_to_file("=== MESSAGE EVENT DEBUG ===");
-                        log_to_file(&format!("Full event: {}", serde_json::to_string_pretty(event).unwrap_or_default()));
-                        log_to_file(&format!("user field: {:?}", event.get("user")));
-                        log_to_file(&format!("username field: {:?}", event.get("username")));
-                        log_to_file(&format!("bot_id field: {:?}", event.get("bot_id")));
-                        log_to_file(&format!("bot_profile field: {:?}", event.get("bot_profile")));
-                        log_to_file(&format!("app_id field: {:?}", event.get("app_id")));
-
                         // Fetch user name - prioritize user field first (real users), then bot_profile, username, bot_id
                         let user_name = if event.get("user").is_some() && user_id_event != "unknown" {
-                            // Regular user - fetch from API (prioritize this over bot_profile)
-                            if let Ok(user_info) = Self::fetch_user_info(http, token, user_id_event).await {
-                                log_to_file(&format!("Using fetched user info: {}", user_info));
-                                user_info
+                            // Regular user - prefer cache to avoid HTTP on every event
+                            if let Some(info) = user_info_cache.lock().await.get(user_id_event).cloned() {
+                                info.name
                             } else {
-                                log_to_file(&format!("Failed to fetch user info, using user_id: {}", user_id_event));
-                                user_id_event.to_string()
+                                if let Ok(user_info) = Self::fetch_user_info(http, token, user_id_event).await {
+                                    user_name_cache
+                                        .lock()
+                                        .await
+                                        .insert(user_id_event.to_string(), user_info.clone());
+                                    user_info_cache.lock().await.insert(
+                                        user_id_event.to_string(),
+                                        CachedUserInfo {
+                                            name: user_info.clone(),
+                                            is_bot: false,
+                                            deleted: false,
+                                        },
+                                    );
+                                    user_info
+                                } else {
+                                    user_id_event.to_string()
+                                }
                             }
                         } else if let Some(bot_profile) = event.get("bot_profile") {
                             // Slack app/webhook with bot_profile (only if no user field)
@@ -601,15 +631,12 @@ impl SlackClient {
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("Bot")
                                 .to_string();
-                            log_to_file(&format!("Using bot_profile.name: {}", name));
                             name
                         } else if let Some(username) = event.get("username").and_then(|u| u.as_str()) {
                             // Bot with username field
-                            log_to_file(&format!("Using username field: {}", username));
                             username.to_string()
                         } else if let Some(bot_id) = event.get("bot_id").and_then(|b| b.as_str()) {
                             // Bot message - fetch bot info
-                            log_to_file(&format!("Fetching bot info for bot_id: {}", bot_id));
                             let client = SlackClient {
                                 http: http.clone(),
                                 token: token.to_string(),
@@ -618,30 +645,18 @@ impl SlackClient {
                                 ws_handle: Arc::new(Mutex::new(None)),
                                 ws_shutdown: Arc::new(Mutex::new(None)),
                                 user_name_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                                user_info_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
                             };
-                            let bot_name = client.resolve_bot_name(bot_id).await;
-                            log_to_file(&format!("Got bot name: {}", bot_name));
-                            bot_name
+                            client.resolve_bot_name(bot_id).await
                         } else {
-                            log_to_file(&format!("No user info available, using user_id_event: {}", user_id_event));
                             user_id_event.to_string()
                         };
-                        log_to_file(&format!("Final user_name: {}", user_name));
 
                         // Extract files from event
-                        log_to_file(&format!("Files field in event: {:?}", event.get("files")));
                         let files: Vec<SlackFile> = event
                             .get("files")
-                            .and_then(|f| {
-                                log_to_file(&format!("Files JSON: {}", serde_json::to_string_pretty(f).unwrap_or_default()));
-                                serde_json::from_value(f.clone()).ok()
-                            })
+                            .and_then(|f| serde_json::from_value(f.clone()).ok())
                             .unwrap_or_default();
-                        log_to_file(&format!("Parsed {} files", files.len()));
-                        for (idx, file) in files.iter().enumerate() {
-                            log_to_file(&format!("  File {}: id={:?}, mimetype={:?}, filetype={:?}, name={:?}", 
-                                idx, file.id, file.mimetype, file.filetype, file.name));
-                        }
 
                         pending_updates.lock().await.push(SlackUpdate::NewMessage {
                             channel_id: channel_id.to_string(),
@@ -689,20 +704,25 @@ impl SlackClient {
                 return name.clone();
             }
         }
-        // Fetch and cache
-        let name = Self::fetch_user_info(&self.http, &self.token, user_id)
+
+        self.fetch_user_info_cached(user_id)
             .await
-            .unwrap_or_else(|_| user_id.to_string());
-        self.user_name_cache
-            .lock()
-            .await
-            .insert(user_id.to_string(), name.clone());
-        name
+            .map(|info| info.name)
+            .unwrap_or_else(|| user_id.to_string())
     }
 
     /// Get a snapshot of the user name cache for synchronous lookups.
     pub async fn get_user_name_cache(&self) -> std::collections::HashMap<String, String> {
         self.user_name_cache.lock().await.clone()
+    }
+
+    fn display_name_for_user(user: &User) -> String {
+        user.profile
+            .as_ref()
+            .and_then(|p| p.display_name.as_ref())
+            .filter(|n| !n.is_empty())
+            .cloned()
+            .unwrap_or_else(|| user.name.clone())
     }
 
     async fn fetch_user_info(http: &HttpClient, token: &str, user_id: &str) -> Result<String> {
@@ -718,20 +738,21 @@ impl SlackClient {
             .await?;
 
         if response.ok {
-            // Prefer display_name > name (username)
-            let display_name = response
-                .user
-                .profile
-                .and_then(|p| p.display_name)
-                .filter(|n| !n.is_empty());
-            Ok(display_name.unwrap_or(response.user.name))
+            Ok(Self::display_name_for_user(&response.user))
         } else {
             Ok(user_id.to_string())
         }
     }
 
-    pub async fn is_user_bot(&self, user_id: &str) -> bool {
-        let resp = self
+    async fn fetch_user_info_cached(&self, user_id: &str) -> Option<CachedUserInfo> {
+        {
+            let cache = self.user_info_cache.lock().await;
+            if let Some(info) = cache.get(user_id) {
+                return Some(info.clone());
+            }
+        }
+
+        let response: UserInfoResponse = self
             .http
             .get(&format!(
                 "https://slack.com/api/users.info?user={}",
@@ -739,37 +760,51 @@ impl SlackClient {
             ))
             .bearer_auth(&self.token)
             .send()
-            .await;
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
 
-        if let Ok(resp) = resp {
-            if let Ok(info) = resp.json::<UserInfoResponse>().await {
-                if info.ok {
-                    return info.user.is_bot;
-                }
-            }
+        if !response.ok {
+            return None;
         }
-        false
+
+        let info = CachedUserInfo {
+            name: Self::display_name_for_user(&response.user),
+            is_bot: response.user.is_bot,
+            deleted: response.user.deleted,
+        };
+
+        self.user_info_cache
+            .lock()
+            .await
+            .insert(user_id.to_string(), info.clone());
+        self.user_name_cache
+            .lock()
+            .await
+            .insert(user_id.to_string(), info.name.clone());
+        Some(info)
     }
 
-    pub async fn is_user_deleted(&self, user_id: &str) -> bool {
-        let resp = self
-            .http
-            .get(&format!(
-                "https://slack.com/api/users.info?user={}",
-                user_id
-            ))
-            .bearer_auth(&self.token)
-            .send()
-            .await;
+    async fn prefetch_user_infos(&self, user_ids: Vec<String>) {
+        let user_ids: std::collections::HashSet<String> = user_ids.into_iter().collect();
+        let missing: Vec<String> = {
+            let cache = self.user_info_cache.lock().await;
+            user_ids
+                .into_iter()
+                .filter(|user_id| !cache.contains_key(user_id))
+                .collect()
+        };
 
-        if let Ok(resp) = resp {
-            if let Ok(info) = resp.json::<UserInfoResponse>().await {
-                if info.ok {
-                    return info.user.deleted;
+        futures::stream::iter(missing)
+            .for_each_concurrent(16, |user_id| {
+                let slack = self.clone();
+                async move {
+                    let _ = slack.fetch_user_info_cached(&user_id).await;
                 }
-            }
-        }
-        false
+            })
+            .await;
     }
 
     pub async fn resolve_bot_name(&self, bot_id: &str) -> String {
@@ -834,56 +869,93 @@ impl SlackClient {
     }
 
     pub async fn get_conversations(&self) -> Result<Vec<ChatInfo>> {
-        let response: ConversationsListResponse = self
-            .http
-            .get("https://slack.com/api/conversations.list?types=public_channel,private_channel,mpim,im&limit=200")
-            .bearer_auth(&self.token)
-            .send()
-            .await?
-            .json()
-            .await?;
+        // Use users.conversations which returns everything the current user has
+        // access to (public, private, shared, mpim, im) across paginated results.
+        let mut all_channels: Vec<Channel> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut url = String::from(
+                "https://slack.com/api/users.conversations?types=public_channel,private_channel,mpim,im&limit=200&exclude_archived=true",
+            );
+            if let Some(ref c) = cursor {
+                url.push_str(&format!("&cursor={}", c));
+            }
 
-        if !response.ok {
-            return Err(anyhow!("Failed to fetch conversations"));
+            let response: ConversationsListResponse = self
+                .http
+                .get(&url)
+                .bearer_auth(&self.token)
+                .send()
+                .await?
+                .json()
+                .await?;
+
+            if !response.ok {
+                return Err(anyhow!("Failed to fetch conversations"));
+            }
+
+            all_channels.extend(response.channels);
+
+            match response.response_metadata.and_then(|m| {
+                if m.next_cursor.trim().is_empty() {
+                    None
+                } else {
+                    Some(m.next_cursor)
+                }
+            }) {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
         }
 
         let my_user_id = self.get_my_user_id().await.unwrap_or_default();
+        let dm_user_ids = all_channels
+            .iter()
+            .filter(|ch| ch.is_im)
+            .filter_map(|ch| ch.user.clone())
+            .collect();
+        self.prefetch_user_infos(dm_user_ids).await;
 
         let mut chats = Vec::new();
-        for ch in response.channels {
+        for ch in all_channels {
             if ch.is_archived {
                 continue;
             }
-            
-            // Skip channels we're not a member of (except for DMs which don't have is_member)
-            if !ch.is_im && !ch.is_mpim && !ch.is_member {
-                continue;
-            }
+
+            let dm_user_info = if ch.is_im {
+                if let Some(ref uid) = ch.user {
+                    self.fetch_user_info_cached(uid).await
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             
             // Skip DMs with deleted users
-            if ch.is_im {
-                if let Some(ref uid) = ch.user {
-                    if self.is_user_deleted(uid).await {
-                        continue;
-                    }
-                }
+            if dm_user_info
+                .as_ref()
+                .map(|info| info.deleted)
+                .unwrap_or(false)
+            {
+                continue;
             }
 
             // Determine section
             let section = if ch.is_mpim {
                 ChatSection::Group
             } else if ch.is_im {
-                // Check if DM target is a bot
-                let is_bot = if let Some(ref uid) = ch.user {
-                    self.is_user_bot(uid).await
-                } else {
-                    false
-                };
-                if is_bot {
+                if dm_user_info
+                    .as_ref()
+                    .map(|info| info.is_bot)
+                    .unwrap_or(false)
+                {
                     ChatSection::Bot
                 } else {
                     ChatSection::DirectMessage
                 }
+            } else if ch.is_ext_shared || ch.is_shared || ch.is_org_shared {
+                ChatSection::Shared
             } else if ch.is_private || ch.is_group {
                 ChatSection::Private
             } else {
@@ -895,15 +967,19 @@ impl SlackClient {
                     // Fetch members and build "Name1, Name2" excluding self
                     match self.get_conversation_members(&ch.id).await {
                         Ok(members) => {
+                            let members: Vec<String> = members
+                                .into_iter()
+                                .filter(|mid| mid != &my_user_id)
+                                .collect();
+                            self.prefetch_user_infos(members.clone()).await;
+
                             let mut names = Vec::new();
                             for mid in &members {
-                                if mid != &my_user_id {
-                                    let n = self.resolve_user_name(mid).await;
-                                    // Use first name only
-                                    let first =
-                                        n.split_whitespace().next().unwrap_or(&n).to_string();
-                                    names.push(first);
-                                }
+                                let n = self.resolve_user_name(mid).await;
+                                // Use first name only
+                                let first =
+                                    n.split_whitespace().next().unwrap_or(&n).to_string();
+                                names.push(first);
                             }
                             if names.is_empty() {
                                 ch.name.unwrap_or_else(|| ch.id.clone())
@@ -915,7 +991,9 @@ impl SlackClient {
                     }
                 }
                 ChatSection::DirectMessage | ChatSection::Bot => {
-                    if let Some(ref user_id) = ch.user {
+                    if let Some(info) = dm_user_info {
+                        info.name
+                    } else if let Some(ref user_id) = ch.user {
                         self.resolve_user_name(user_id).await
                     } else {
                         ch.name.unwrap_or_else(|| ch.id.clone())

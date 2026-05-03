@@ -1,9 +1,12 @@
-/// Send a desktop notification (macOS and Linux)
-pub fn send_desktop_notification(title: &str, message: &str) {
+/// Send a desktop notification with an explicit urgency level.
+/// Urgency must be one of: "low", "normal", "critical".
+/// On macOS, urgency is ignored (osascript has no concept of urgency).
+pub fn send_desktop_notification_ex(title: &str, message: &str, urgency: &str) {
     use std::process::Command;
 
     #[cfg(target_os = "macos")]
     {
+        let _ = urgency;
         let safe_title = title.replace('"', "\\\"");
         let safe_msg = message.replace('"', "\\\"");
         let script = format!(
@@ -15,10 +18,21 @@ pub fn send_desktop_notification(title: &str, message: &str) {
 
     #[cfg(target_os = "linux")]
     {
+        let urgency = match urgency {
+            "low" | "normal" | "critical" => urgency,
+            _ => "normal",
+        };
+        // `--category=im.received` and `--hint=string:desktop-entry:slack-client`
+        // help notification daemons (Dunst, GNOME Shell, KDE) group/route the
+        // popup correctly and show it in the persistent notification list.
+        // `--icon=mail-message-new` gives a sensible default icon.
         let _ = Command::new("notify-send")
             .arg("--app-name=Slack Client")
-            .arg("--urgency=normal")
-            .arg("--expire-time=5000")
+            .arg(format!("--urgency={}", urgency))
+            .arg("--expire-time=8000")
+            .arg("--category=im.received")
+            .arg("--icon=mail-message-new")
+            .arg("--hint=string:desktop-entry:slack-client")
             .arg(title)
             .arg(message)
             .output();

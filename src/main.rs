@@ -23,7 +23,17 @@ use app::App;
 async fn main() -> Result<()> {
     // Create app BEFORE entering TUI mode (so authentication can work)
     let mut app = App::new().await?;
-    
+
+    // Query terminal for graphics protocol BEFORE entering raw/alt-screen mode.
+    let image_picker = match ratatui_image::picker::Picker::from_query_stdio() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("Image preview disabled (picker init failed): {e}");
+            None
+        }
+    };
+    app.image_picker = image_picker;
+
     // Load chat history for saved panes
     let _ = app.load_all_pane_histories().await;
 
@@ -66,11 +76,19 @@ async fn run_app<B: ratatui::backend::Backend + std::io::Write>(
 
         // Process Slack events
         app.process_slack_events().await?;
-        app.maybe_run_fallback_refresh().await?;
 
         // Poll for workspace switch completion
         if app.poll_workspace_switch() {
-            let _ = app.load_all_pane_histories().await;
+            app.needs_redraw = true;
+        }
+
+        // Poll for async chat-load completion
+        if app.poll_open_chat_load() {
+            app.needs_redraw = true;
+        }
+
+        // Poll for async image-load completion
+        if app.poll_image_loads() {
             app.needs_redraw = true;
         }
 
@@ -108,6 +126,16 @@ async fn run_app<B: ratatui::backend::Backend + std::io::Write>(
                     let remaining = expire - now;
                     next_wake = next_wake.min(remaining);
                 }
+            }
+        }
+
+        if let Some(expire) = app.status_expire {
+            if now >= expire {
+                app.status_message = None;
+                app.status_expire = None;
+                app.needs_redraw = true;
+            } else {
+                next_wake = next_wake.min(expire - now);
             }
         }
 
@@ -173,6 +201,10 @@ async fn run_app<B: ratatui::backend::Backend + std::io::Write>(
                         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.toggle_emojis();
                         }
+                        // Ctrl+P: Toggle inline image preview
+                        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.toggle_image_preview();
+                        }
                         // Ctrl+T: Toggle timestamps
                         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.toggle_timestamps();
@@ -228,6 +260,10 @@ async fn run_app<B: ratatui::backend::Backend + std::io::Write>(
                         // Enter: Open chat (when focus on chat list)
                         KeyCode::Enter if app.focus_on_chat_list => {
                             app.open_selected_chat().await?;
+                        }
+                        // Space: Toggle collapse of the section containing the selected chat
+                        KeyCode::Char(' ') if app.focus_on_chat_list => {
+                            app.toggle_selected_section();
                         }
                         // Shift+Up/Down: Always scroll messages
                         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -363,3 +399,4 @@ async fn run_app<B: ratatui::backend::Backend + std::io::Write>(
 
     Ok(())
 }
+
