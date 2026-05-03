@@ -6,6 +6,8 @@ Terminal-native Slack client built with Rust and [ratatui](https://ratatui.rs). 
 
 A keyboard-first Slack client that lives entirely in your terminal. Multi-pane workflows, live updates over Socket Mode, optional inline image rendering for Kitty-compatible terminals, and persistent layout/settings across sessions.
 
+Lightweight footprint: ~11 MB RAM and well under 1% CPU at idle.
+
 ## Key Features
 
 ### Multi-Workspace Support
