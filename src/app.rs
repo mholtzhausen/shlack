@@ -34,6 +34,9 @@ pub struct App {
     pub focus_on_chat_list: bool,
     pub status_message: Option<String>,
     pub status_expire: Option<std::time::Instant>,
+    pub last_realtime_event: Option<std::time::Instant>,
+    pub unread_dirty: bool,
+    pub last_unread_save: Option<std::time::Instant>,
     pub pane_areas: std::collections::HashMap<usize, Rect>,
     pub chat_list_area: Option<Rect>,
     pub chat_list_scroll_offset: usize,
@@ -359,6 +362,9 @@ impl App {
             focus_on_chat_list: true,
             status_message: None,
             status_expire: None,
+            last_realtime_event: None,
+            unread_dirty: false,
+            last_unread_save: None,
             chat_list_area: None,
             chat_list_scroll_offset: 0,
             pending_open_chat: false,
@@ -571,6 +577,11 @@ impl App {
     pub async fn process_slack_events(&mut self) -> Result<()> {
         let updates = self.slack.get_pending_updates().await;
 
+        if !updates.is_empty() {
+            self.last_realtime_event = Some(std::time::Instant::now());
+            self.needs_redraw = true;
+        }
+
         for update in updates {
             match update {
                 SlackUpdate::NewMessage {
@@ -711,9 +722,13 @@ impl App {
                     let known_channel = self.chats.iter().any(|c| c.id == channel_id);
                     if let Some(chat) = self.chats.iter_mut().find(|c| c.id == channel_id) {
                         if focused_pane_saw_it {
-                            chat.unread = 0;
+                            if chat.unread != 0 {
+                                chat.unread = 0;
+                                self.unread_dirty = true;
+                            }
                         } else if !is_self {
                             chat.unread = chat.unread.saturating_add(1);
+                            self.unread_dirty = true;
                         }
                     } else if !is_self {
                         // Unknown channel (e.g. new DM, newly added channel) – refresh the
@@ -846,6 +861,21 @@ impl App {
             }
         }
 
+        // Debounced persistence of unread counters: at most once every 5s.
+        if self.unread_dirty {
+            let now = std::time::Instant::now();
+            let due = self
+                .last_unread_save
+                .map(|t| now.duration_since(t).as_secs() >= 5)
+                .unwrap_or(true);
+            if due {
+                if self.save_state().is_ok() {
+                    self.unread_dirty = false;
+                    self.last_unread_save = Some(now);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -920,7 +950,10 @@ impl App {
 
         // Clear unread counter when opening the chat
         if let Some(chat_info) = self.chats.get_mut(self.selected_chat_idx) {
-            chat_info.unread = 0;
+            if chat_info.unread != 0 {
+                chat_info.unread = 0;
+                self.unread_dirty = true;
+            }
         }
         
         // Clear mention counter for current workspace when opening any chat
@@ -1257,15 +1290,15 @@ impl App {
             .collect();
         let has_other_mentions = !other_workspace_mentions.is_empty();
         
-        let main_constraints = if has_status && has_other_mentions {
-            vec![Constraint::Min(0), Constraint::Length(1), Constraint::Length(1)]
-        } else if has_status {
-            vec![Constraint::Min(0), Constraint::Length(1)]
-        } else if has_other_mentions {
-            vec![Constraint::Min(0), Constraint::Length(1)]
-        } else {
-            vec![Constraint::Min(0)]
-        };
+        let mut main_constraints: Vec<Constraint> = vec![Constraint::Min(0)];
+        if has_other_mentions {
+            main_constraints.push(Constraint::Length(1));
+        }
+        if has_status {
+            main_constraints.push(Constraint::Length(1));
+        }
+        // Always reserve 1 row for the realtime stats footer
+        main_constraints.push(Constraint::Length(1));
 
         let outer = Layout::default()
             .direction(Direction::Vertical)
@@ -1325,26 +1358,43 @@ impl App {
         );
         self.pane_areas = pane_areas;
 
-        // Draw notification bar for mentions in other workspaces
+        // Footer rows are stacked from the bottom upward in this order:
+        // [stats] (always), [status] (if any), [mentions] (if any).
+        let mut footer_idx = outer.len() - 1;
+
+        // Realtime stats footer (always present)
+        let stats_text = match self.last_realtime_event {
+            Some(t) => {
+                let age = t.elapsed().as_secs();
+                let state = if age >= 30 { "stale" } else { "ok" };
+                format!(" RT {} {}s", state, age)
+            }
+            None => " RT —".to_string(),
+        };
+        let stats = Paragraph::new(stats_text)
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default());
+        f.render_widget(stats, outer[footer_idx]);
+
+        if has_status {
+            footer_idx -= 1;
+            let status = Paragraph::new(self.status_message.as_ref().unwrap().clone())
+                .style(Style::default().fg(Color::White))
+                .block(Block::default());
+            f.render_widget(status, outer[footer_idx]);
+        }
+
         if has_other_mentions {
+            footer_idx -= 1;
             let mention_text: String = other_workspace_mentions
                 .iter()
                 .map(|(name, count)| format!("{}: {}@", name, count))
                 .collect::<Vec<_>>()
                 .join(" | ");
             let notification = Paragraph::new(format!(" Mentions in other workspaces: {} (Ctrl+N to switch)", mention_text))
-                .style(Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
+                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
                 .block(Block::default());
-            let notification_idx = if has_status { outer.len() - 2 } else { outer.len() - 1 };
-            f.render_widget(notification, outer[notification_idx]);
-        }
-
-        // Draw status bar
-        if has_status {
-            let status = Paragraph::new(self.status_message.as_ref().unwrap().clone())
-                .style(Style::default().bg(Color::DarkGray).fg(Color::White))
-                .block(Block::default());
-            f.render_widget(status, outer[outer.len() - 1]);
+            f.render_widget(notification, outer[footer_idx]);
         }
     }
 
