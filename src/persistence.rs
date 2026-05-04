@@ -163,6 +163,9 @@ pub struct AppSettings {
 
     #[serde(default = "default_collapsed_sections")]
     pub collapsed_sections: Vec<String>,
+
+    #[serde(default)]
+    pub chat_list_width: Option<u16>,
 }
 
 fn default_collapsed_sections() -> Vec<String> {
@@ -184,6 +187,7 @@ impl Default for AppSettings {
             mouse_support: true,
             show_image_preview: true,
             collapsed_sections: default_collapsed_sections(),
+            chat_list_width: None,
         }
     }
 }
@@ -228,6 +232,7 @@ impl AppState {
             mouse_support: config.settings.mouse_support,
             show_image_preview: config.settings.show_image_preview,
             collapsed_sections: default_collapsed_sections(),
+            chat_list_width: None,
         });
         
         Ok(Self {

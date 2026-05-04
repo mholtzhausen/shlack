@@ -339,6 +339,13 @@ async fn run_app<B: ratatui::backend::Backend + std::io::Write>(
                         KeyCode::Delete if !app.focus_on_chat_list => {
                             app.delete_forward();
                         }
+                        // Ctrl+Left/Right: Resize chat list
+                        KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.resize_chat_list(-2);
+                        }
+                        KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.resize_chat_list(2);
+                        }
                         // Left/Right: Move cursor
                         KeyCode::Left if !app.focus_on_chat_list => {
                             app.move_cursor_left();

@@ -56,6 +56,7 @@ pub struct App {
     pub show_line_numbers: bool,
     pub show_timestamps: bool,
     pub show_chat_list: bool,
+    pub chat_list_width: Option<u16>,
     pub show_user_colors: bool,
     pub show_borders: bool,
     pub mouse_support: bool,
@@ -380,6 +381,7 @@ impl App {
             show_line_numbers: app_state.settings.show_line_numbers,
             show_timestamps: app_state.settings.show_timestamps,
             show_chat_list: app_state.settings.show_chat_list,
+            chat_list_width: app_state.settings.chat_list_width,
             show_user_colors: app_state.settings.show_user_colors,
             show_borders: app_state.settings.show_borders,
             mouse_support: app_state.settings.mouse_support,
@@ -1046,14 +1048,14 @@ impl App {
         thread_pane.chat_name = format!("Thread: {}", parent_user);
         self.panes.push(thread_pane);
 
-        // Always split the focused pane horizontally so the thread opens
-        // in a new pane stacked under the current one (no side pane).
-        if !self.pane_tree.split_pane_with_ratio(self.focused_pane_idx, SplitDirection::Horizontal, new_idx, 50) {
-            self.pane_tree.split_with_ratio(SplitDirection::Horizontal, new_idx, 50);
+        // Open the thread in a vertical split (side-by-side) on the focused pane.
+        if !self.pane_tree.split_pane_with_ratio(self.focused_pane_idx, SplitDirection::Vertical, new_idx, 50) {
+            self.pane_tree.split_with_ratio(SplitDirection::Vertical, new_idx, 50);
         }
-        
-        // Focus the new thread pane
+
+        // Focus the new thread pane and put the cursor in its input box.
         self.focused_pane_idx = new_idx;
+        self.focus_on_chat_list = false;
 
         // Load thread replies
         match self
@@ -1306,25 +1308,31 @@ impl App {
             .split(f.area());
 
         let (chat_area, pane_area) = if self.show_chat_list {
-            // Calculate dynamic width based on longest chat name
-            let max_name_len = self.chats.iter()
-                .map(|c| {
-                    let prefix = if c.unread > 0 { format!("({}) ", c.unread) } else { String::new() };
-                    let emoji = match c.section {
-                        ChatSection::Public => "# ",
-                        ChatSection::Private => "🔒 ",
-                        ChatSection::Shared => "🔗 ",
-                        ChatSection::DirectMessage => "👤 ",
-                        ChatSection::Group => "👥 ",
-                        ChatSection::Bot => "🤖 ",
-                    };
-                    prefix.len() + emoji.len() + c.name.len()
-                })
-                .max()
-                .unwrap_or(20);
-            
-            // Add padding for borders and some breathing room
-            let chat_list_width = (max_name_len + 6).min(40).max(15) as u16;
+            let chat_list_width = if let Some(w) = self.chat_list_width {
+                let total = outer[0].width;
+                let max_w = total.saturating_sub(20).max(10);
+                w.clamp(10, max_w)
+            } else {
+                // Calculate dynamic width based on longest chat name
+                let max_name_len = self.chats.iter()
+                    .map(|c| {
+                        let prefix = if c.unread > 0 { format!("({}) ", c.unread) } else { String::new() };
+                        let emoji = match c.section {
+                            ChatSection::Public => "# ",
+                            ChatSection::Private => "🔒 ",
+                            ChatSection::Shared => "🔗 ",
+                            ChatSection::DirectMessage => "👤 ",
+                            ChatSection::Group => "👥 ",
+                            ChatSection::Bot => "🤖 ",
+                        };
+                        prefix.len() + emoji.len() + c.name.len()
+                    })
+                    .max()
+                    .unwrap_or(20);
+
+                // Add padding for borders and some breathing room
+                (max_name_len + 6).min(40).max(15) as u16
+            };
             
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
@@ -2043,6 +2051,7 @@ impl App {
                 mouse_support: self.mouse_support,
                 show_image_preview: self.show_image_preview,
                 collapsed_sections: self.collapsed_sections.iter().cloned().collect(),
+                chat_list_width: self.chat_list_width,
             },
             aliases: self.aliases.clone(),
             layout: LayoutData {
@@ -2468,6 +2477,18 @@ impl App {
         self.needs_redraw = true;
     }
 
+    pub fn resize_chat_list(&mut self, delta: i16) {
+        if !self.show_chat_list {
+            return;
+        }
+        let current = self.chat_list_width.unwrap_or_else(|| {
+            self.chat_list_area.map(|a| a.width).unwrap_or(25)
+        }) as i32;
+        let next = (current + delta as i32).clamp(10, 200) as u16;
+        self.chat_list_width = Some(next);
+        self.needs_redraw = true;
+    }
+
     pub fn toggle_reactions(&mut self) {
         self.show_reactions = !self.show_reactions;
         for pane in &mut self.panes {
@@ -2630,6 +2651,7 @@ impl App {
                 mouse_support: self.mouse_support,
                 show_image_preview: self.show_image_preview,
                 collapsed_sections: self.collapsed_sections.iter().cloned().collect(),
+                chat_list_width: self.chat_list_width,
             },
             aliases: self.aliases.clone(),
             layout: LayoutData::default(),
