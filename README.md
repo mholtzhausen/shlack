@@ -4,6 +4,16 @@ Terminal-native Slack client built with Rust and [ratatui](https://ratatui.rs). 
 
 ![Layout mockup](docs/screenshot.svg)
 
+### Layout variants
+
+Four-pane setups with an open thread, mention chips, attachment cards, code blocks, reaction badges and inline GIF / image previews:
+
+| Theme | Preview |
+|---|---|
+| Dark | ![Dark](docs/screenshot-dark.svg) |
+| Light | ![Light](docs/screenshot-light.svg) |
+| Superlight | ![Superlight](docs/screenshot-superlight.svg) |
+
 ## Overview
 
 A keyboard-first Slack client that lives entirely in your terminal. Multi-pane workflows, live updates over Socket Mode, optional inline image rendering for Kitty-compatible terminals, and persistent layout/settings across sessions.

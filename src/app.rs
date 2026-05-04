@@ -29,6 +29,9 @@ pub struct App {
     pub my_user_id: String, // Current user's ID
     pub chats: Vec<ChatInfo>,
     pub selected_chat_idx: usize,
+    /// When `Some`, the chat-list cursor is on a Threads-section row instead
+    /// of a regular chat. Up/down/Enter dispatch accordingly.
+    pub selected_thread_idx: Option<usize>,
     pub panes: Vec<ChatPane>,
     pub focused_pane_idx: usize,
     pub pane_tree: PaneNode,
@@ -44,6 +47,7 @@ pub struct App {
     pub chat_list_area: Option<Rect>,
     pub chat_list_scroll_offset: usize,
     pub pending_open_chat: bool,
+    pub pending_open_thread: Option<usize>,
     pending_open_chat_load: Option<
         tokio::sync::oneshot::Receiver<Result<OpenChatLoadResult, String>>,
     >,
@@ -71,6 +75,14 @@ pub struct App {
     pub unread_mentions: std::collections::HashMap<String, u32>, // workspace_name -> count
     pub workspace_unread_cache: std::collections::HashMap<String, std::collections::HashMap<String, u32>>,
     pub collapsed_sections: std::collections::HashSet<String>,
+
+    // Threads I'm involved in (parent is mine, mentioned in a reply, or replied).
+    // Populated from realtime events + history backfill, and persisted to disk.
+    pub threads: Vec<ThreadInfo>,
+    pub threads_dirty: bool,
+    // (channel_id, ts) of messages I've sent — used to detect when somebody
+    // starts a thread on one of my messages.
+    pub my_message_ts: std::collections::HashSet<(String, String)>,
 
     // Inline image preview (Kitty graphics protocol via ratatui-image)
     pub image_picker: Option<ratatui_image::picker::Picker>,
@@ -143,6 +155,21 @@ fn username_color(username: &str) -> Color {
 enum ChatListRow {
     Header(String),
     Chat(usize),
+    Thread(usize),
+}
+
+/// A Slack thread the current user is involved in.
+#[derive(Clone, Debug)]
+pub struct ThreadInfo {
+    pub channel_id: String,
+    pub channel_name: String,
+    pub thread_ts: String,
+    pub last_reply_ts: String,
+    pub unread: u32,
+    pub mentioned: bool,    // Mentioned in a reply
+    pub on_my_message: bool, // The parent message is mine
+    pub i_replied: bool,    // I've posted a reply in this thread
+    pub last_reply_user: Option<String>,
 }
 
 #[derive(Clone)]
@@ -159,6 +186,42 @@ struct OpenChatLoadResult {
     channel_id: String,
     messages: Vec<SlackMessage>,
     name_cache: std::collections::HashMap<String, String>,
+}
+
+/// Load persisted threads for the given workspace and convert into runtime
+/// `ThreadInfo` entries. Returns an empty Vec if nothing is persisted.
+fn load_threads_for(config: &Config, workspace_name: &str) -> Vec<ThreadInfo> {
+    let store = crate::persistence::ThreadStore::load(config).unwrap_or_default();
+    store
+        .workspaces
+        .get(workspace_name)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| ThreadInfo {
+            channel_id: p.channel_id,
+            channel_name: p.channel_name,
+            thread_ts: p.thread_ts,
+            last_reply_ts: p.last_reply_ts,
+            unread: p.unread,
+            mentioned: p.mentioned,
+            on_my_message: p.on_my_message,
+            i_replied: p.i_replied,
+            last_reply_user: p.last_reply_user,
+        })
+        .collect()
+}
+
+/// Format a Slack ts ("1234567890.123456") as a short HH:MM string for the
+/// Threads section label. Falls back to the raw ts if parsing fails.
+fn format_thread_time(ts: &str) -> String {
+    let secs: Option<i64> = ts.split('.').next().and_then(|s| s.parse().ok());
+    if let Some(secs) = secs {
+        if let Some(dt) = Local.timestamp_opt(secs, 0).single() {
+            return dt.format("%H:%M").to_string();
+        }
+    }
+    ts.to_string()
 }
 
 /// Detects images embedded in attachments (e.g. Giphy, URL unfurls).
@@ -319,6 +382,7 @@ impl App {
             aliases: Aliases::default(),
             layout: LayoutData::default(),
             workspace_unread_counts: std::collections::HashMap::new(),
+            workspace_threads: std::collections::HashMap::new(),
         });
 
         // Load initial chats
@@ -377,12 +441,15 @@ impl App {
 
         let (image_load_tx, image_load_rx) = tokio::sync::mpsc::unbounded_channel();
 
+        let initial_threads = load_threads_for(&config, &workspace.name);
+
         let app = Self {
             config,
             slack,
             my_user_id,
             chats,
             selected_chat_idx: 0,
+            selected_thread_idx: None,
             panes,
             focused_pane_idx,
             pane_tree,
@@ -397,6 +464,7 @@ impl App {
             chat_list_area: None,
             chat_list_scroll_offset: 0,
             pending_open_chat: false,
+            pending_open_thread: None,
             pending_open_chat_load: None,
             pending_refresh_chats: false,
             pending_reload_panes: false,
@@ -426,6 +494,9 @@ impl App {
                 .iter()
                 .cloned()
                 .collect(),
+            threads: initial_threads,
+            threads_dirty: false,
+            my_message_ts: std::collections::HashSet::new(),
             image_picker: None,
             image_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             image_load_tx,
@@ -642,6 +713,83 @@ impl App {
                     let (media_type, file_ids, file_urls, file_names) = detected;
                     let is_thread_reply = matches!(thread_ts.as_ref(), Some(t) if t != &ts);
                     let root_thread_ts = thread_ts.clone().unwrap_or_else(|| ts.clone());
+
+                    // Track our own messages so we can later detect when
+                    // someone starts a thread on one of them.
+                    if is_self {
+                        self.my_message_ts.insert((channel_id.clone(), ts.clone()));
+                    }
+
+                    // Update the Threads section if this is a reply we care about.
+                    if is_thread_reply {
+                        let parent_ts = thread_ts.clone().unwrap_or_else(|| ts.clone());
+                        let on_my_message = self
+                            .my_message_ts
+                            .contains(&(channel_id.clone(), parent_ts.clone()));
+                        let already_known = self
+                            .threads
+                            .iter()
+                            .any(|t| t.channel_id == channel_id && t.thread_ts == parent_ts);
+                        let i_replied_now = is_self;
+                        let concerns_me = on_my_message
+                            || mentions_me
+                            || already_known
+                            || i_replied_now;
+                        if concerns_me {
+                            let channel_name = self
+                                .chats
+                                .iter()
+                                .find(|c| c.id == channel_id)
+                                .map(|c| c.name.clone())
+                                .unwrap_or_else(|| channel_id.clone());
+
+                            // Don't bump unread for replies in a thread we're
+                            // currently viewing, or replies we wrote ourselves.
+                            let in_focused_thread = self
+                                .panes
+                                .get(self.focused_pane_idx)
+                                .map(|p| {
+                                    p.channel_id_str.as_deref() == Some(channel_id.as_str())
+                                        && p.thread_ts.as_deref() == Some(parent_ts.as_str())
+                                })
+                                .unwrap_or(false);
+                            let bump_unread = !is_self && !in_focused_thread;
+
+                            if let Some(t) = self
+                                .threads
+                                .iter_mut()
+                                .find(|t| t.channel_id == channel_id && t.thread_ts == parent_ts)
+                            {
+                                t.last_reply_ts = ts.clone();
+                                t.last_reply_user = Some(user_name.clone());
+                                if bump_unread {
+                                    t.unread = t.unread.saturating_add(1);
+                                }
+                                if mentions_me {
+                                    t.mentioned = true;
+                                }
+                                if i_replied_now {
+                                    t.i_replied = true;
+                                }
+                                if on_my_message {
+                                    t.on_my_message = true;
+                                }
+                            } else {
+                                self.threads.push(ThreadInfo {
+                                    channel_id: channel_id.clone(),
+                                    channel_name,
+                                    thread_ts: parent_ts.clone(),
+                                    last_reply_ts: ts.clone(),
+                                    unread: if bump_unread { 1 } else { 0 },
+                                    mentioned: mentions_me,
+                                    on_my_message,
+                                    i_replied: i_replied_now,
+                                    last_reply_user: Some(user_name.clone()),
+                                });
+                            }
+                            self.threads_dirty = true;
+                        }
+                    }
 
                     // Update panes showing this channel/thread
                     let mut seen_in_open_pane = false;
@@ -902,8 +1050,9 @@ impl App {
             }
         }
 
-        // Debounced persistence of unread counters: at most once every 5s.
-        if self.unread_dirty {
+        // Debounced persistence of unread counters and threads: at most once
+        // every 5s. Both flags share one save_state() call.
+        if self.unread_dirty || self.threads_dirty {
             let now = std::time::Instant::now();
             let due = self
                 .last_unread_save
@@ -912,6 +1061,7 @@ impl App {
             if due {
                 if self.save_state().is_ok() {
                     self.unread_dirty = false;
+                    self.threads_dirty = false;
                     self.last_unread_save = Some(now);
                 }
             }
@@ -1070,6 +1220,28 @@ impl App {
         self.set_status(&format!("Loading {}...", chat.name));
         self.needs_redraw = true;
         self.focus_on_chat_list = false;
+        Ok(())
+    }
+
+    /// Open the thread referenced by `pending_open_thread` (set by mouse click
+    /// on a thread row in the chat list). Resets the thread's unread counter.
+    pub async fn open_pending_thread(&mut self) -> Result<()> {
+        let idx = match self.pending_open_thread.take() {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let info = match self.threads.get(idx).cloned() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        // Reset visual highlight before opening.
+        if let Some(t) = self.threads.get_mut(idx) {
+            t.unread = 0;
+            t.mentioned = false;
+        }
+        let parent_user = info.last_reply_user.unwrap_or_else(|| info.channel_name.clone());
+        self.open_thread(&info.channel_id, &info.thread_ts, &parent_user)
+            .await?;
         Ok(())
     }
 
@@ -1458,6 +1630,24 @@ impl App {
 
         let mut rows: Vec<ChatListRow> = Vec::new();
 
+        // Threads section — threads I'm involved in (most recent first).
+        if !self.threads.is_empty() {
+            let label = "Threads".to_string();
+            let collapsed = self.collapsed_sections.contains(&label);
+            rows.push(ChatListRow::Header(label));
+            if !collapsed {
+                let mut indices: Vec<usize> = (0..self.threads.len()).collect();
+                indices.sort_by(|a, b| {
+                    self.threads[*b]
+                        .last_reply_ts
+                        .cmp(&self.threads[*a].last_reply_ts)
+                });
+                for i in indices {
+                    rows.push(ChatListRow::Thread(i));
+                }
+            }
+        }
+
         // New section (unread > 0)
         let new_chats: Vec<usize> = self
             .chats
@@ -1566,9 +1756,25 @@ impl App {
             .panes
             .get(self.focused_pane_idx)
             .and_then(|p| p.channel_id_str.clone());
-        let active_chat_idx: Option<usize> = active_channel_id.as_ref().and_then(|id| {
-            self.chats.iter().position(|c| &c.id == id)
-        });
+        let active_thread_ts = self
+            .panes
+            .get(self.focused_pane_idx)
+            .and_then(|p| p.thread_ts.clone());
+        let active_chat_idx: Option<usize> = if active_thread_ts.is_some() {
+            // When a thread pane is focused, don't highlight the channel row.
+            None
+        } else {
+            active_channel_id.as_ref().and_then(|id| {
+                self.chats.iter().position(|c| &c.id == id)
+            })
+        };
+        let active_thread_idx: Option<usize> = match (&active_channel_id, &active_thread_ts) {
+            (Some(cid), Some(tts)) => self
+                .threads
+                .iter()
+                .position(|t| &t.channel_id == cid && &t.thread_ts == tts),
+            _ => None,
+        };
 
         // Ensure scroll offset keeps selected row visible
         if selected_row < self.chat_list_scroll_offset {
@@ -1631,6 +1837,44 @@ impl App {
                         ));
                     }
 
+                    ListItem::new(Line::from(spans)).style(base_style)
+                }
+                ChatListRow::Thread(thread_idx) => {
+                    let t = &self.threads[*thread_idx];
+                    let is_active = active_thread_idx == Some(*thread_idx);
+                    let is_cursor = self.selected_thread_idx == Some(*thread_idx);
+                    let highlight = (t.unread > 0) && (t.mentioned || t.on_my_message);
+
+                    let base_style = if is_active {
+                        Style::default().bg(Color::Blue).fg(Color::White)
+                    } else if highlight {
+                        Style::default()
+                            .bg(Color::Red)
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else if t.unread > 0 {
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+
+                    let prefix = if is_cursor && self.focus_on_chat_list && !is_active {
+                        "▸ "
+                    } else {
+                        "  "
+                    };
+                    // Format the thread label as "↳ #channel · HH:MM"
+                    let time = format_thread_time(&t.thread_ts);
+                    let mut label = format!("↳ {} · {}", t.channel_name, time);
+                    if t.unread > 0 {
+                        label.push_str(&format!(" ({})", t.unread));
+                    }
+                    let spans = vec![
+                        Span::styled(prefix.to_string(), base_style),
+                        Span::styled(label, base_style),
+                    ];
                     ListItem::new(Line::from(spans)).style(base_style)
                 }
             })
@@ -2133,6 +2377,32 @@ impl App {
             .get(self.config.active_workspace)
             .map(|w| w.name.clone())
             .unwrap_or_default();
+
+        // Persist threads for this workspace. Merge into existing store so
+        // other workspaces' threads are preserved.
+        if !current_workspace_name.is_empty() {
+            let mut store = crate::persistence::ThreadStore::load(&self.config)
+                .unwrap_or_default();
+            let serialized: Vec<crate::persistence::PersistedThread> = self
+                .threads
+                .iter()
+                .map(|t| crate::persistence::PersistedThread {
+                    channel_id: t.channel_id.clone(),
+                    channel_name: t.channel_name.clone(),
+                    thread_ts: t.thread_ts.clone(),
+                    last_reply_ts: t.last_reply_ts.clone(),
+                    unread: t.unread,
+                    mentioned: t.mentioned,
+                    on_my_message: t.on_my_message,
+                    i_replied: t.i_replied,
+                    last_reply_user: t.last_reply_user.clone(),
+                })
+                .collect();
+            store
+                .workspaces
+                .insert(current_workspace_name.clone(), serialized);
+            let _ = store.save(&self.config);
+        }
         let mut workspace_unread_counts = self.workspace_unread_cache.clone();
         workspace_unread_counts.insert(
             current_workspace_name,
@@ -2177,6 +2447,7 @@ impl App {
                 pane_tree: Some(self.pane_tree.clone()),
             },
             workspace_unread_counts,
+            workspace_threads: std::collections::HashMap::new(),
         };
 
         state.save(&self.config)
@@ -2193,30 +2464,78 @@ impl App {
             .collect()
     }
 
+    /// Visible thread indices in the order they appear in the chat list.
+    fn visible_thread_indices(&self) -> Vec<usize> {
+        self.build_chat_list_rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                ChatListRow::Thread(idx) => Some(idx),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn select_next_chat(&mut self) {
-        let visible = self.visible_chat_indices();
-        if visible.is_empty() {
+        let threads = self.visible_thread_indices();
+        let chats = self.visible_chat_indices();
+
+        // Currently on a thread row?
+        if let Some(cur) = self.selected_thread_idx {
+            let pos = threads.iter().position(|&i| i == cur).unwrap_or(0);
+            if pos + 1 < threads.len() {
+                self.selected_thread_idx = Some(threads[pos + 1]);
+            } else {
+                // Past last thread → jump to first chat row.
+                self.selected_thread_idx = None;
+                if let Some(&first) = chats.first() {
+                    self.selected_chat_idx = first;
+                }
+            }
             return;
         }
-        let pos = visible
+
+        // On a chat row.
+        if chats.is_empty() {
+            return;
+        }
+        let pos = chats
             .iter()
             .position(|&i| i == self.selected_chat_idx)
             .unwrap_or(0);
-        let next = (pos + 1).min(visible.len() - 1);
-        self.selected_chat_idx = visible[next];
+        let next = (pos + 1).min(chats.len() - 1);
+        self.selected_chat_idx = chats[next];
     }
 
     pub fn select_previous_chat(&mut self) {
-        let visible = self.visible_chat_indices();
-        if visible.is_empty() {
+        let threads = self.visible_thread_indices();
+        let chats = self.visible_chat_indices();
+
+        if let Some(cur) = self.selected_thread_idx {
+            let pos = threads.iter().position(|&i| i == cur).unwrap_or(0);
+            let prev = pos.saturating_sub(1);
+            self.selected_thread_idx = Some(threads[prev]);
             return;
         }
-        let pos = visible
+
+        if chats.is_empty() {
+            // No chats but maybe threads — jump to last thread.
+            if let Some(&last) = threads.last() {
+                self.selected_thread_idx = Some(last);
+            }
+            return;
+        }
+        let pos = chats
             .iter()
             .position(|&i| i == self.selected_chat_idx)
             .unwrap_or(0);
-        let prev = pos.saturating_sub(1);
-        self.selected_chat_idx = visible[prev];
+        if pos == 0 {
+            // At top of chat list → wrap up to last thread, if any.
+            if let Some(&last) = threads.last() {
+                self.selected_thread_idx = Some(last);
+            }
+            return;
+        }
+        self.selected_chat_idx = chats[pos - 1];
     }
 
     pub fn next_pane(&mut self) {
@@ -2229,10 +2548,21 @@ impl App {
     }
     
     fn clear_unread_for_focused_pane(&mut self) {
-        // Clear unread counter for the channel shown in the focused pane
-        if let Some(channel_id) = self.panes.get(self.focused_pane_idx)
-            .and_then(|p| p.channel_id_str.as_ref()) {
-            if let Some(chat) = self.chats.iter_mut().find(|c| &c.id == channel_id) {
+        let pane = self.panes.get(self.focused_pane_idx);
+        let channel_id = pane.and_then(|p| p.channel_id_str.clone());
+        let thread_ts = pane.and_then(|p| p.thread_ts.clone());
+
+        if let (Some(cid), Some(tts)) = (channel_id.as_ref(), thread_ts.as_ref()) {
+            if let Some(t) = self
+                .threads
+                .iter_mut()
+                .find(|t| &t.channel_id == cid && &t.thread_ts == tts)
+            {
+                t.unread = 0;
+                t.mentioned = false;
+            }
+        } else if let Some(cid) = channel_id.as_ref() {
+            if let Some(chat) = self.chats.iter_mut().find(|c| &c.id == cid) {
                 chat.unread = 0;
             }
         }
@@ -2694,10 +3024,16 @@ impl App {
                     }
                     Some(ChatListRow::Chat(chat_idx)) => {
                         self.selected_chat_idx = *chat_idx;
+                        self.selected_thread_idx = None;
                         self.pending_open_chat = true;
                         // Single-click should open the chat and immediately
                         // hand focus back to the pane so typing works without
                         // a second click into the message area.
+                        self.focus_on_chat_list = false;
+                    }
+                    Some(ChatListRow::Thread(thread_idx)) => {
+                        self.selected_thread_idx = Some(*thread_idx);
+                        self.pending_open_thread = Some(*thread_idx);
                         self.focus_on_chat_list = false;
                     }
                     None => {}
@@ -2771,6 +3107,7 @@ impl App {
             aliases: self.aliases.clone(),
             layout: LayoutData::default(),
             workspace_unread_counts: std::collections::HashMap::new(),
+            workspace_threads: std::collections::HashMap::new(),
         });
 
         // Restore pane tree
@@ -2988,6 +3325,57 @@ impl App {
                     pane.scroll_offset = usize::MAX;
                     pane.chat_name.clone()
                 };
+                // Backfill the Threads section from this loaded history. We
+                // only see parent messages here (history doesn't return replies
+                // inline), so we seed threads where either the parent is mine
+                // or the parent mentions me, and reply_count > 0.
+                let channel_name_for_threads = self
+                    .chats
+                    .iter()
+                    .find(|c| c.id == load.channel_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| load.channel_id.clone());
+                let mut backfilled = false;
+                for slack_msg in &load.messages {
+                    let parent_ts = slack_msg.ts.clone();
+                    let reply_count = slack_msg.reply_count.unwrap_or(0);
+                    if reply_count == 0 {
+                        continue;
+                    }
+                    let parent_is_mine = slack_msg.user.as_deref() == Some(&self.my_user_id);
+                    let parent_mentions_me =
+                        Self::message_mentions_user(&slack_msg.rendered_text(), &self.my_user_id);
+                    if !(parent_is_mine || parent_mentions_me) {
+                        continue;
+                    }
+                    if parent_is_mine {
+                        self.my_message_ts
+                            .insert((load.channel_id.clone(), parent_ts.clone()));
+                    }
+                    if let Some(t) = self.threads.iter_mut().find(|t| {
+                        t.channel_id == load.channel_id && t.thread_ts == parent_ts
+                    }) {
+                        if parent_is_mine {
+                            t.on_my_message = true;
+                        }
+                    } else {
+                        self.threads.push(ThreadInfo {
+                            channel_id: load.channel_id.clone(),
+                            channel_name: channel_name_for_threads.clone(),
+                            thread_ts: parent_ts.clone(),
+                            last_reply_ts: parent_ts.clone(),
+                            unread: 0, // history backfill: treat as already seen
+                            mentioned: false,
+                            on_my_message: parent_is_mine,
+                            i_replied: false,
+                            last_reply_user: None,
+                        });
+                        backfilled = true;
+                    }
+                }
+                if backfilled {
+                    self.threads_dirty = true;
+                }
                 self.user_name_cache = load.name_cache;
                 self.needs_redraw = true;
                 self.set_status(&format!("Loaded {}", loaded_chat_name));

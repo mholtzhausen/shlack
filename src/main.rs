@@ -113,6 +113,12 @@ async fn run_app<B: ratatui::backend::Backend + std::io::Write>(
             app.needs_redraw = true;
         }
 
+        // Handle pending thread open (from mouse click on a thread row)
+        if app.pending_open_thread.is_some() {
+            app.open_pending_thread().await?;
+            app.needs_redraw = true;
+        }
+
         // Check expiry timers
         let now = std::time::Instant::now();
         let mut next_wake = std::time::Duration::from_millis(50);
@@ -263,9 +269,14 @@ async fn run_app<B: ratatui::backend::Backend + std::io::Write>(
                                 app.send_message().await?;
                             }
                         }
-                        // Enter: Open chat (when focus on chat list)
+                        // Enter: Open chat or thread (when focus on chat list)
                         KeyCode::Enter if app.focus_on_chat_list => {
-                            app.open_selected_chat().await?;
+                            if let Some(idx) = app.selected_thread_idx {
+                                app.pending_open_thread = Some(idx);
+                                app.open_pending_thread().await?;
+                            } else {
+                                app.open_selected_chat().await?;
+                            }
                         }
                         // Space: Toggle collapse of the section containing the selected chat
                         KeyCode::Char(' ') if app.focus_on_chat_list => {

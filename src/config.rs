@@ -341,4 +341,8 @@ impl Config {
     pub fn settings_path(&self) -> PathBuf {
         self.config_dir.join("settings.json")
     }
+
+    pub fn threads_path(&self) -> PathBuf {
+        self.config_dir.join("threads.json")
+    }
 }

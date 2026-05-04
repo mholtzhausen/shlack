@@ -124,6 +124,54 @@ pub struct AppState {
     pub layout: LayoutData,
     #[serde(default)]
     pub workspace_unread_counts: HashMap<String, HashMap<String, u32>>,
+    #[serde(default)]
+    pub workspace_threads: HashMap<String, Vec<PersistedThread>>,
+}
+
+/// Serializable mirror of `ThreadInfo`. Stored per-workspace so threads
+/// the user is involved in survive restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedThread {
+    pub channel_id: String,
+    pub channel_name: String,
+    pub thread_ts: String,
+    #[serde(default)]
+    pub last_reply_ts: String,
+    #[serde(default)]
+    pub unread: u32,
+    #[serde(default)]
+    pub mentioned: bool,
+    #[serde(default)]
+    pub on_my_message: bool,
+    #[serde(default)]
+    pub i_replied: bool,
+    #[serde(default)]
+    pub last_reply_user: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ThreadStore {
+    #[serde(default)]
+    pub workspaces: HashMap<String, Vec<PersistedThread>>,
+}
+
+impl ThreadStore {
+    pub fn load(config: &Config) -> Result<Self> {
+        let path = config.threads_path();
+        if path.exists() {
+            let content = fs::read_to_string(path)?;
+            Ok(serde_json::from_str(&content)?)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    pub fn save(&self, config: &Config) -> Result<()> {
+        let path = config.threads_path();
+        let content = serde_json::to_string_pretty(self)?;
+        fs::write(path, content)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +288,7 @@ impl AppState {
             aliases: Aliases::load(config)?,
             layout: LayoutData::load(config)?,
             workspace_unread_counts: HashMap::new(),
+            workspace_threads: HashMap::new(),
         })
     }
 
