@@ -1741,6 +1741,16 @@ impl App {
             Some(dt.format("%H:%M").to_string())
         };
 
+        // Compute the longest sender name width in this pane so we can
+        // right-pad each name to a fixed column. Result: every message body
+        // begins at the same column, while names stay left-aligned.
+        let nick_pad_width: usize = pane
+            .msg_data
+            .iter()
+            .map(|m| UnicodeWidthStr::width(m.sender_name.as_str()))
+            .max()
+            .unwrap_or(0);
+
         // Messages with emojis, reactions, and thread indicators
         let mut message_lines: Vec<Line> = Vec::new();
         let mut image_overlays: Vec<(usize, String, String)> = Vec::new();
@@ -1802,8 +1812,12 @@ impl App {
                     .fg(username_color(&msg.sender_name))
                     .add_modifier(Modifier::BOLD)
             };
+            // Right-pad the name with spaces so every message body starts at
+            // the same column, regardless of nickname length.
+            let nick_w = UnicodeWidthStr::width(msg.sender_name.as_str());
+            let pad = nick_pad_width.saturating_sub(nick_w);
             prefix_spans.push(Span::styled(
-                format!("{}: ", msg.sender_name),
+                format!("{}{} ", msg.sender_name, " ".repeat(pad)),
                 username_style,
             ));
 
