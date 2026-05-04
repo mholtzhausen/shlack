@@ -4,15 +4,11 @@ Terminal-native Slack client built with Rust and [ratatui](https://ratatui.rs). 
 
 ![Layout mockup](docs/screenshot.svg)
 
-### Layout variants
+![Dark](docs/screenshot-dark.svg)
 
-Four-pane setups with an open thread, mention chips, attachment cards, code blocks, reaction badges and inline GIF / image previews:
+![Light](docs/screenshot-light.svg)
 
-| Theme | Preview |
-|---|---|
-| Dark | ![Dark](docs/screenshot-dark.svg) |
-| Light | ![Light](docs/screenshot-light.svg) |
-| Superlight | ![Superlight](docs/screenshot-superlight.svg) |
+![Superlight](docs/screenshot-superlight.svg)
 
 ## Overview
 
