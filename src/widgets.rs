@@ -1,5 +1,18 @@
 use ratatui::text::Line;
 
+/// A structured representation of a Slack message attachment / app card.
+/// Built once at parse time and rendered as a compact bordered box later.
+#[derive(Clone, Debug, Default)]
+pub struct AttachmentCard {
+    pub color: Option<String>,        // hex like "#36a64f" or "good"/"warning"/"danger"
+    pub author: Option<String>,
+    pub title: Option<String>,
+    pub title_link: Option<String>,
+    pub pretext: Option<String>,
+    pub body: String,                 // rendered mrkdwn (from blocks or text)
+    pub footer: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterType {
     Sender,
@@ -16,7 +29,7 @@ pub struct MessageData {
     pub ts: String,                    // Slack timestamp string (for thread_ts)
     pub reactions: Vec<(String, u32)>, // (emoji_name, count)
     pub reply_count: u32,
-    pub forwarded_text: Option<String>,
+    pub cards: Vec<AttachmentCard>,    // Structured attachments for boxed rendering
     pub mentions_me: bool, // True if this message mentions the current user
     pub local_echo_id: Option<u64>, // Unique ID for local echo deduplication
     pub is_edited: bool, // True if message was edited

@@ -105,6 +105,8 @@ static SLACK_EMOJI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
 });
 
 /// Convert a Slack emoji name to its Unicode character.
+/// Looks up our curated static map first (fast common path), then falls back
+/// to the `emojis` crate which covers every Unicode shortcode.
 pub fn slack_emoji_to_unicode(name: &str) -> String {
     // Handle skin tone modifiers
     let base_name = if let Some(idx) = name.find("::skin-tone-") {
@@ -114,10 +116,26 @@ pub fn slack_emoji_to_unicode(name: &str) -> String {
     };
 
     if let Some(&emoji) = SLACK_EMOJI.get(base_name) {
-        emoji.to_string()
-    } else {
-        format!(":{}:", name)
+        return emoji.to_string();
     }
+    if let Some(e) = emojis::get_by_shortcode(base_name) {
+        return e.as_str().to_string();
+    }
+    // Some Slack shortcodes use "_" but the emojis crate canonicalizes "-"
+    // (or vice versa) — try the swap before giving up.
+    let alt = if base_name.contains('_') {
+        base_name.replace('_', "-")
+    } else if base_name.contains('-') {
+        base_name.replace('-', "_")
+    } else {
+        String::new()
+    };
+    if !alt.is_empty() {
+        if let Some(e) = emojis::get_by_shortcode(&alt) {
+            return e.as_str().to_string();
+        }
+    }
+    format!(":{}:", name)
 }
 
 /// Replace :emoji_name: patterns in text with Unicode characters.
@@ -159,7 +177,8 @@ pub fn convert_slack_emojis(text: &str) -> String {
 }
 
 /// Convert Slack user mentions <@U12345> to @name.
-pub fn convert_slack_mentions(text: &str, resolve_user: &impl Fn(&str) -> String) -> String {
+#[allow(dead_code)]
+pub fn convert_slack_mentions(text: &str, resolve_user: &(impl Fn(&str) -> String + ?Sized)) -> String {
     let mut result = String::with_capacity(text.len());
     let mut rest = text;
 
@@ -188,6 +207,7 @@ pub fn convert_slack_mentions(text: &str, resolve_user: &impl Fn(&str) -> String
 }
 
 /// Convert Slack link format <URL|text> and <URL> to just the URL.
+#[allow(dead_code)]
 pub fn convert_slack_links(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut rest = text;
@@ -236,16 +256,500 @@ fn remove_skin_tone_modifiers(text: &str) -> String {
 }
 
 /// Format message text: convert links, mentions, and emojis.
+#[allow(dead_code)]
 pub fn format_message_text(
     text: &str,
     show_emojis: bool,
-    resolve_user: &impl Fn(&str) -> String,
+    resolve_user: &(impl Fn(&str) -> String + ?Sized),
 ) -> String {
     let mut out = convert_slack_links(text);
     out = remove_skin_tone_modifiers(&out);
     out = convert_slack_mentions(&out, resolve_user);
     if show_emojis {
         out = convert_slack_emojis(&out);
+    }
+    out
+}
+
+/// Background color used for triple-backtick code blocks. Exposed so the
+/// renderer can detect block-only lines and pad the row.
+pub const CODE_BLOCK_BG: ratatui::style::Color = ratatui::style::Color::Rgb(25, 25, 35);
+
+/// Format message text into styled spans, parsing Slack mrkdwn:
+///   *bold*, _italic_, ~strike~, `code`, ```code block```
+/// Plus line-level constructs: `> ` blockquote, `• ` / `N. ` lists.
+/// Mentions, channel refs, links and emojis are also resolved.
+pub fn format_message_spans(
+    text: &str,
+    show_emojis: bool,
+    resolve_user: &(impl Fn(&str) -> String + ?Sized),
+) -> Vec<ratatui::text::Span<'static>> {
+    use ratatui::style::{Color, Style};
+    use ratatui::text::Span;
+
+    // Don't re-process line prefixes inside a triple-backtick block.
+    // Detect blocks first and split the text into (in_code, slice) chunks.
+    let chunks = split_code_fences(text);
+
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for (in_code, chunk) in chunks {
+        if in_code {
+            // Keep the raw text exactly so character offsets are preserved
+            // (matters for live input preview where cursor positioning is
+            // computed against the raw buffer). Use the dedicated CODE_BLOCK_BG
+            // shade so the renderer can recognize block lines and pad the row.
+            out.push(Span::styled(
+                chunk.to_string(),
+                Style::default().fg(Color::LightYellow).bg(CODE_BLOCK_BG),
+            ));
+            continue;
+        }
+        let mut first_line = true;
+        for line in chunk.split('\n') {
+            if !first_line {
+                out.push(Span::raw("\n"));
+            }
+            first_line = false;
+
+            let (prefix, content, base) = classify_line_prefix(line);
+            for span in prefix {
+                out.push(span);
+            }
+            // Encode mentions/channels/broadcasts/links into private-use
+            // sentinels so the mrkdwn parser leaves them alone. Then extract
+            // them as chip-styled spans after parsing.
+            let mut prepared = remove_skin_tone_modifiers(content);
+            prepared = encode_special_tokens(&prepared, resolve_user);
+            if show_emojis {
+                prepared = convert_slack_emojis(&prepared);
+            }
+            let parsed = parse_mrkdwn_spans(&prepared);
+            let chipped = extract_chip_spans(parsed);
+            if let Some(base_style) = base {
+                for s in chipped {
+                    let combined = base_style.patch(s.style);
+                    out.push(Span::styled(s.content.into_owned(), combined));
+                }
+            } else {
+                out.extend(chipped);
+            }
+        }
+    }
+
+    // If everything resolved to nothing, still return a single empty span so
+    // downstream wrapping treats it as one line.
+    if out.is_empty() {
+        out.push(Span::raw(String::new()));
+    }
+    out
+}
+
+/// Split text on triple-backtick fences. Returns (in_code, slice) tuples.
+fn split_code_fences(text: &str) -> Vec<(bool, &str)> {
+    let mut out: Vec<(bool, &str)> = Vec::new();
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    let mut last = 0;
+    while i + 3 <= n {
+        if bytes[i] == b'`' && bytes[i + 1] == b'`' && bytes[i + 2] == b'`' {
+            // close fence?
+            let open = i;
+            let mut j = open + 3;
+            while j + 3 <= n {
+                if bytes[j] == b'`' && bytes[j + 1] == b'`' && bytes[j + 2] == b'`' {
+                    if last < open {
+                        out.push((false, &text[last..open]));
+                    }
+                    out.push((true, &text[open + 3..j]));
+                    i = j + 3;
+                    last = i;
+                    break;
+                }
+                j += 1;
+            }
+            if j + 3 > n {
+                // unterminated; treat rest as plain
+                break;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    if last < n {
+        out.push((false, &text[last..n]));
+    }
+    out
+}
+
+/// Detect line-level prefixes (blockquote, list bullet, numbered list).
+/// Returns the styled prefix spans, the remaining content, and an optional
+/// base style to apply to the content.
+fn classify_line_prefix(line: &str) -> (Vec<ratatui::text::Span<'static>>, &str, Option<ratatui::style::Style>) {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::Span;
+
+    let bar_color = Color::Cyan;
+
+    // Blockquote: `> ` or just `>`
+    if let Some(rest) = line.strip_prefix("> ") {
+        let prefix = vec![Span::styled(
+            "▎ ".to_string(),
+            Style::default().fg(bar_color),
+        )];
+        let base = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        return (prefix, rest, Some(base));
+    }
+    if line == ">" {
+        let prefix = vec![Span::styled(
+            "▎".to_string(),
+            Style::default().fg(bar_color),
+        )];
+        return (prefix, "", None);
+    }
+
+    // Unordered list: `• ` (Slack bullet) or `- `
+    if let Some(rest) = line.strip_prefix("• ") {
+        let prefix = vec![Span::styled(
+            "• ".to_string(),
+            Style::default().fg(bar_color),
+        )];
+        return (prefix, rest, None);
+    }
+    if let Some(rest) = line.strip_prefix("- ") {
+        let prefix = vec![Span::styled(
+            "• ".to_string(),
+            Style::default().fg(bar_color),
+        )];
+        return (prefix, rest, None);
+    }
+
+    // Ordered list: `N. ` or `N) `
+    let bytes = line.as_bytes();
+    let mut digits = 0;
+    while digits < bytes.len() && bytes[digits].is_ascii_digit() {
+        digits += 1;
+    }
+    if digits > 0 && digits < bytes.len() {
+        let sep = bytes[digits];
+        if (sep == b'.' || sep == b')')
+            && bytes.get(digits + 1).copied() == Some(b' ')
+        {
+            let marker = &line[..digits + 2];
+            let rest = &line[digits + 2..];
+            let prefix = vec![Span::styled(
+                marker.to_string(),
+                Style::default().fg(bar_color),
+            )];
+            return (prefix, rest, None);
+        }
+    }
+
+    (Vec::new(), line, None)
+}
+
+fn is_left_boundary(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '(' | '[' | '{' | '<' | '"' | '\'' | '*' | '_' | '~' | '`')
+}
+
+fn is_right_boundary(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            ')' | ']' | '}' | '>' | '"' | '\'' | '.' | ',' | '!' | '?' | ';' | ':' | '*' | '_' | '~' | '`'
+        )
+}
+
+fn parse_mrkdwn_spans(text: &str) -> Vec<ratatui::text::Span<'static>> {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::Span;
+
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0;
+
+    // Inline code uses a slightly lighter bg than CODE_BLOCK_BG so the
+    // renderer can distinguish "fill the whole row" (block) from "leave
+    // surrounding text untouched" (inline).
+    let code_style = Style::default()
+        .fg(Color::LightYellow)
+        .bg(Color::Rgb(55, 55, 65));
+
+    while i < n {
+        // Triple-backtick block
+        if i + 3 <= n && chars[i] == '`' && chars[i + 1] == '`' && chars[i + 2] == '`' {
+            let search_start = i + 3;
+            let mut j = search_start;
+            let mut closed = None;
+            while j + 3 <= n {
+                if chars[j] == '`' && chars[j + 1] == '`' && chars[j + 2] == '`' {
+                    closed = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(end) = closed {
+                if !buf.is_empty() {
+                    out.push(Span::raw(std::mem::take(&mut buf)));
+                }
+                let inner: String = chars[search_start..end].iter().collect();
+                let trimmed = inner.trim_matches('\n').to_string();
+                out.push(Span::styled(trimmed, code_style));
+                i = end + 3;
+                continue;
+            }
+        }
+
+        // Inline `code`
+        if chars[i] == '`' {
+            if let Some(rel) = chars[i + 1..].iter().position(|&c| c == '`') {
+                if rel > 0 {
+                    if !buf.is_empty() {
+                        out.push(Span::raw(std::mem::take(&mut buf)));
+                    }
+                    let inner: String = chars[i + 1..i + 1 + rel].iter().collect();
+                    out.push(Span::styled(inner, code_style));
+                    i = i + 1 + rel + 1;
+                    continue;
+                }
+            }
+        }
+
+        // *bold* / _italic_ / ~strike~
+        let m = chars[i];
+        if matches!(m, '*' | '_' | '~') {
+            let left_ok = i == 0 || is_left_boundary(chars[i - 1]);
+            let next_ok = chars
+                .get(i + 1)
+                .map(|&c| !c.is_whitespace() && c != m)
+                .unwrap_or(false);
+            if left_ok && next_ok {
+                // Find the closing marker on the same logical run.
+                let mut j = i + 1;
+                let mut found = None;
+                while j < n {
+                    if chars[j] == m {
+                        let prev = chars[j - 1];
+                        let right_ok = j + 1 >= n || is_right_boundary(chars[j + 1]);
+                        if !prev.is_whitespace() && prev != m && right_ok {
+                            found = Some(j);
+                            break;
+                        }
+                    } else if chars[j] == '\n' {
+                        // Style runs don't cross blank lines.
+                        break;
+                    }
+                    j += 1;
+                }
+                if let Some(end) = found {
+                    if !buf.is_empty() {
+                        out.push(Span::raw(std::mem::take(&mut buf)));
+                    }
+                    let inner: String = chars[i + 1..end].iter().collect();
+                    let style = match m {
+                        '*' => Style::default().add_modifier(Modifier::BOLD),
+                        '_' => Style::default().add_modifier(Modifier::ITALIC),
+                        '~' => Style::default().add_modifier(Modifier::CROSSED_OUT),
+                        _ => Style::default(),
+                    };
+                    out.push(Span::styled(inner, style));
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+
+        buf.push(chars[i]);
+        i += 1;
+    }
+    if !buf.is_empty() {
+        out.push(Span::raw(buf));
+    }
+    out
+}
+
+// ---- Chip / mention / link styling --------------------------------------------
+
+// Private-use sentinel codepoints used to mark up special tokens before
+// mrkdwn parsing, then extracted into chip-styled spans afterwards.
+// Pairs are start/end characters wrapping the visible chip text.
+const SEN_MENTION_O: char = '\u{E000}';
+const SEN_MENTION_C: char = '\u{E001}';
+const SEN_CHANNEL_O: char = '\u{E002}';
+const SEN_CHANNEL_C: char = '\u{E003}';
+const SEN_BROADCAST_O: char = '\u{E004}';
+const SEN_BROADCAST_C: char = '\u{E005}';
+const SEN_LINK_O: char = '\u{E006}';
+const SEN_LINK_C: char = '\u{E007}';
+
+/// Encode Slack `<...>` tokens (mentions, channels, broadcasts, links) into
+/// private-use sentinels. The mrkdwn parser sees the visible chip text as
+/// plain text and won't try to interpret characters inside.
+fn encode_special_tokens(
+    text: &str,
+    resolve_user: &(impl Fn(&str) -> String + ?Sized),
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find('>') {
+            let inner = &after[..end];
+            encode_one_token(inner, resolve_user, &mut out);
+            rest = &after[end + 1..];
+        } else {
+            out.push('<');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn encode_one_token(
+    inner: &str,
+    resolve_user: &(impl Fn(&str) -> String + ?Sized),
+    out: &mut String,
+) {
+    if inner.is_empty() {
+        out.push_str("<>");
+        return;
+    }
+    let first = inner.chars().next().unwrap();
+    match first {
+        '@' => {
+            // <@U12345> or <@U12345|name>
+            let body = &inner[1..];
+            let (id, label) = match body.find('|') {
+                Some(p) => (&body[..p], Some(&body[p + 1..])),
+                None => (body, None),
+            };
+            let display = label
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| resolve_user(id));
+            out.push(SEN_MENTION_O);
+            out.push('@');
+            out.push_str(&display);
+            out.push(SEN_MENTION_C);
+        }
+        '#' => {
+            // <#C12345> or <#C12345|channel-name>
+            let body = &inner[1..];
+            let (_id, label) = match body.find('|') {
+                Some(p) => (&body[..p], Some(&body[p + 1..])),
+                None => (body, None),
+            };
+            let display = label
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| inner.to_string());
+            out.push(SEN_CHANNEL_O);
+            out.push('#');
+            out.push_str(&display);
+            out.push(SEN_CHANNEL_C);
+        }
+        '!' => {
+            // <!here>, <!channel>, <!everyone>, <!subteam^S123|name>, <!date^...>
+            let body = &inner[1..];
+            let (kind, label_opt) = match body.find('|') {
+                Some(p) => (&body[..p], Some(&body[p + 1..])),
+                None => (body, None),
+            };
+            let label = match (kind, label_opt) {
+                ("here", _) => "@here".to_string(),
+                ("channel", _) => "@channel".to_string(),
+                ("everyone", _) => "@everyone".to_string(),
+                (k, Some(l)) if k.starts_with("subteam") => {
+                    if l.starts_with('@') {
+                        l.to_string()
+                    } else {
+                        format!("@{}", l)
+                    }
+                }
+                (_, Some(l)) => l.to_string(),
+                (k, None) => format!("@{}", k.split('^').next().unwrap_or(k)),
+            };
+            out.push(SEN_BROADCAST_O);
+            out.push_str(&label);
+            out.push(SEN_BROADCAST_C);
+        }
+        _ if inner.starts_with("http://") || inner.starts_with("https://") => {
+            let visible = match inner.find('|') {
+                Some(p) => &inner[p + 1..],
+                None => inner,
+            };
+            out.push(SEN_LINK_O);
+            out.push_str(visible);
+            out.push(SEN_LINK_C);
+        }
+        _ => {
+            // Unknown token type — pass through.
+            out.push_str(inner);
+        }
+    }
+}
+
+/// Walk parsed mrkdwn spans and split each span on chip sentinels, emitting
+/// chip-styled spans for the marked ranges. The base style of the original
+/// span is preserved on surrounding text and patched onto the chip style so
+/// e.g. a *_<@user>_* still renders bold-italic with the chip background.
+fn extract_chip_spans(spans: Vec<ratatui::text::Span<'static>>) -> Vec<ratatui::text::Span<'static>> {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::Span;
+
+    let mention_style = Style::default()
+        .fg(Color::White)
+        .bg(Color::Rgb(67, 108, 191))
+        .add_modifier(Modifier::BOLD);
+    let channel_style = mention_style;
+    let broadcast_style = Style::default()
+        .fg(Color::White)
+        .bg(Color::Rgb(190, 60, 60))
+        .add_modifier(Modifier::BOLD);
+    let link_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::UNDERLINED);
+
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for span in spans {
+        let base = span.style;
+        let text = span.content.into_owned();
+        let chars: Vec<char> = text.chars().collect();
+        let n = chars.len();
+        let mut i = 0;
+        let mut buf = String::new();
+        while i < n {
+            let c = chars[i];
+            let chip_kind = match c {
+                SEN_MENTION_O => Some((SEN_MENTION_C, mention_style)),
+                SEN_CHANNEL_O => Some((SEN_CHANNEL_C, channel_style)),
+                SEN_BROADCAST_O => Some((SEN_BROADCAST_C, broadcast_style)),
+                SEN_LINK_O => Some((SEN_LINK_C, link_style)),
+                _ => None,
+            };
+            if let Some((closer, chip_style)) = chip_kind {
+                if let Some(rel) = chars[i + 1..].iter().position(|&x| x == closer) {
+                    if !buf.is_empty() {
+                        out.push(Span::styled(std::mem::take(&mut buf), base));
+                    }
+                    let inner: String = chars[i + 1..i + 1 + rel].iter().collect();
+                    out.push(Span::styled(inner, base.patch(chip_style)));
+                    i = i + 1 + rel + 1;
+                    continue;
+                }
+            }
+            buf.push(c);
+            i += 1;
+        }
+        if !buf.is_empty() {
+            out.push(Span::styled(buf, base));
+        }
     }
     out
 }

@@ -3,7 +3,7 @@ use chrono::{Local, TimeZone};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap},
     Frame,
 };
@@ -13,12 +13,15 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::commands::CommandHandler;
 use crate::config::Config;
-use crate::formatting::{format_message_text, slack_emoji_to_unicode};
+use crate::formatting::{format_message_spans, slack_emoji_to_unicode};
 use crate::persistence::{Aliases, AppState, LayoutData};
 use crate::slack::{SlackAttachment, SlackClient, SlackMessage, SlackUpdate};
 use crate::split_view::{PaneNode, SplitDirection};
 use crate::utils::send_desktop_notification_ex;
 use crate::widgets::ChatPane;
+
+/// Number of terminal rows reserved for an inline image / GIF preview.
+const IMAGE_PREVIEW_ROWS: usize = 16;
 
 pub struct App {
     pub config: Config,
@@ -158,6 +161,48 @@ struct OpenChatLoadResult {
     name_cache: std::collections::HashMap<String, String>,
 }
 
+/// Detects images embedded in attachments (e.g. Giphy, URL unfurls).
+/// Returns (urls, file_names) for each `attachment.image_url` found.
+fn extract_attachment_images(attachments: &[crate::slack::SlackAttachment]) -> (Vec<String>, Vec<String>) {
+    let mut urls = Vec::new();
+    let mut names = Vec::new();
+    for att in attachments {
+        if let Some(img) = att.image_url.as_ref().filter(|s| !s.is_empty()) {
+            // Take last path segment, stripping query string, as a display name.
+            let name = img
+                .rsplit('/')
+                .next()
+                .and_then(|s| s.split('?').next())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("image")
+                .to_string();
+            urls.push(img.clone());
+            names.push(name);
+        }
+    }
+    (urls, names)
+}
+
+/// Combined media detection: file uploads + attachment image_url (Giphy etc).
+fn detect_message_media(
+    files: &[crate::slack::SlackFile],
+    attachments: &[crate::slack::SlackAttachment],
+) -> Option<(String, Vec<String>, Vec<String>, Vec<String>)> {
+    let from_files = detect_media_type(files);
+    let (att_urls, att_names) = extract_attachment_images(attachments);
+    if att_urls.is_empty() {
+        return from_files;
+    }
+    match from_files {
+        Some((mt, ids, mut urls, mut names)) => {
+            urls.extend(att_urls);
+            names.extend(att_names);
+            Some((mt, ids, urls, names))
+        }
+        None => Some(("image".to_string(), Vec::new(), att_urls, att_names)),
+    }
+}
+
 fn detect_media_type(files: &[crate::slack::SlackFile]) -> Option<(String, Vec<String>, Vec<String>, Vec<String>)> {
     if files.is_empty() {
         return None;
@@ -214,45 +259,28 @@ fn detect_media_type(files: &[crate::slack::SlackFile]) -> Option<(String, Vec<S
     }
 }
 
-fn forwarded_preview(attachments: &[SlackAttachment]) -> Option<String> {
-    for att in attachments {
-        // For URL previews and forwarded messages, show only title and author
-        // to avoid excessive text that causes scroll issues
-        let mut parts = Vec::new();
-        
-        // Add author name if present
-        if let Some(author) = att.author_name.as_ref().filter(|a| !a.is_empty()) {
-            parts.push(format!("@{}", author));
-        }
-        
-        // Add title if present (main content for URL previews)
-        if let Some(title) = att.title.as_ref().filter(|t| !t.is_empty()) {
-            parts.push(title.clone());
-        }
-        
-        // Only add short text snippets, ignore long URL preview descriptions
-        if let Some(text) = att.text.as_ref().filter(|t| !t.is_empty()) {
-            // Only include text if it's reasonably short (likely a forwarded message, not a URL preview)
-            if text.len() <= 100 {
-                parts.push(text.clone());
-            }
-        }
-        
-        if !parts.is_empty() {
-            return Some(parts.join(" - "));
-        }
-        
-        // Fallback to shortened fallback text
-        if let Some(fallback) = att.fallback.as_ref().filter(|f| !f.is_empty()) {
-            let short_fallback = if fallback.len() > 100 {
-                format!("{}...", &fallback[..100])
-            } else {
-                fallback.clone()
-            };
-            return Some(short_fallback);
-        }
+fn build_cards(attachments: &[SlackAttachment]) -> Vec<crate::widgets::AttachmentCard> {
+    crate::slack::attachments_to_cards(attachments)
+}
+
+/// Parse Slack attachment color into a ratatui Color.
+/// Accepts `#RRGGBB`, `RRGGBB`, or the named values `good`/`warning`/`danger`.
+fn parse_hex_color(s: &str) -> Option<Color> {
+    let s = s.trim();
+    match s.to_ascii_lowercase().as_str() {
+        "good" => return Some(Color::Green),
+        "warning" => return Some(Color::Yellow),
+        "danger" => return Some(Color::Red),
+        _ => {}
     }
-    None
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color::Rgb(r, g, b))
 }
 
 impl App {
@@ -484,18 +512,18 @@ impl App {
                             .iter()
                             .map(|r| (r.name.clone(), r.count))
                             .collect();
-                        let mentions_me = Self::message_mentions_user(&slack_msg.text, &self.my_user_id);
-                        let (media_type, file_ids, file_urls, file_names) = detect_media_type(&slack_msg.files)
+                        let mentions_me = Self::message_mentions_user(&slack_msg.rendered_text(), &self.my_user_id);
+                        let (media_type, file_ids, file_urls, file_names) = detect_message_media(&slack_msg.files, &slack_msg.attachments)
                             .map(|(mt, ids, urls, names)| (Some(mt), ids, urls, names))
                             .unwrap_or((None, Vec::new(), Vec::new(), Vec::new()));
                         let msg_data = crate::widgets::MessageData {
                             sender_name,
-                            text: slack_msg.text.clone(),
+                            text: slack_msg.rendered_text(),
                             is_outgoing: slack_msg.user.as_deref() == Some(&self.my_user_id),
                             ts: slack_msg.ts.clone(),
                             reactions,
                             reply_count: slack_msg.reply_count.unwrap_or(0),
-                            forwarded_text: forwarded_preview(&slack_msg.attachments),
+                            cards: build_cards(&slack_msg.attachments),
                             mentions_me,
                             local_echo_id: None,
                             is_edited: false,
@@ -536,18 +564,18 @@ impl App {
                                 .iter()
                                 .map(|r| (r.name.clone(), r.count))
                                 .collect();
-                            let mentions_me = Self::message_mentions_user(&slack_msg.text, &self.my_user_id);
-                            let (media_type, file_ids, file_urls, file_names) = detect_media_type(&slack_msg.files)
+                            let mentions_me = Self::message_mentions_user(&slack_msg.rendered_text(), &self.my_user_id);
+                            let (media_type, file_ids, file_urls, file_names) = detect_message_media(&slack_msg.files, &slack_msg.attachments)
                                 .map(|(mt, ids, urls, names)| (Some(mt), ids, urls, names))
                                 .unwrap_or((None, Vec::new(), Vec::new(), Vec::new()));
                             let msg_data = crate::widgets::MessageData {
                                 sender_name,
-                                text: slack_msg.text.clone(),
+                                text: slack_msg.rendered_text(),
                                 is_outgoing: slack_msg.user.as_deref() == Some(&self.my_user_id),
                                 ts: slack_msg.ts.clone(),
                                 reactions,
                                 reply_count: slack_msg.reply_count.unwrap_or(0),
-                                forwarded_text: forwarded_preview(&slack_msg.attachments),
+                                cards: build_cards(&slack_msg.attachments),
                                 mentions_me,
                                 local_echo_id: None,
                             is_edited: false,
@@ -594,13 +622,24 @@ impl App {
                     thread_ts,
                     is_bot,
                     is_self,
-                    forwarded,
+                    cards,
+                    inline_image_urls,
                     mentions_me,
                     files,
                 } => {
-                    let (media_type, file_ids, file_urls, file_names) = detect_media_type(&files)
+                    let mut detected = detect_media_type(&files)
                         .map(|(mt, ids, urls, names)| (Some(mt), ids, urls, names))
                         .unwrap_or((None, Vec::new(), Vec::new(), Vec::new()));
+                    if !inline_image_urls.is_empty() {
+                        if detected.0.is_none() {
+                            detected.0 = Some("image".to_string());
+                        }
+                        for (u, n) in inline_image_urls {
+                            detected.2.push(u);
+                            detected.3.push(n);
+                        }
+                    }
+                    let (media_type, file_ids, file_urls, file_names) = detected;
                     let is_thread_reply = matches!(thread_ts.as_ref(), Some(t) if t != &ts);
                     let root_thread_ts = thread_ts.clone().unwrap_or_else(|| ts.clone());
 
@@ -635,7 +674,7 @@ impl App {
                                                         ts: ts.clone(),
                                                         reactions: Vec::new(),
                                                         reply_count: 0,
-                                                        forwarded_text: forwarded.clone(),
+                                                        cards: cards.clone(),
                                                         mentions_me,
                                                         local_echo_id: None,
                             is_edited: false,
@@ -688,7 +727,7 @@ impl App {
                                                     ts: ts.clone(),
                                                     reactions: Vec::new(),
                                                     reply_count: 0,
-                                                    forwarded_text: forwarded.clone(),
+                                                    cards: cards.clone(),
                                                     mentions_me,
                                                     local_echo_id: None,
                             is_edited: false,
@@ -1109,18 +1148,18 @@ impl App {
                         .iter()
                         .map(|r| (r.name.clone(), r.count))
                         .collect();
-                    let mentions_me = Self::message_mentions_user(&slack_msg.text, &self.my_user_id);
-                    let (media_type, file_ids, file_urls, file_names) = detect_media_type(&slack_msg.files)
+                    let mentions_me = Self::message_mentions_user(&slack_msg.rendered_text(), &self.my_user_id);
+                    let (media_type, file_ids, file_urls, file_names) = detect_message_media(&slack_msg.files, &slack_msg.attachments)
                         .map(|(mt, ids, urls, names)| (Some(mt), ids, urls, names))
                         .unwrap_or((None, Vec::new(), Vec::new(), Vec::new()));
                     let msg_data = crate::widgets::MessageData {
                         sender_name,
-                        text: slack_msg.text.clone(),
+                        text: slack_msg.rendered_text(),
                         is_outgoing: slack_msg.user.as_deref() == Some(&self.my_user_id),
                         ts: slack_msg.ts.clone(),
                         reactions,
                         reply_count: 0,
-                        forwarded_text: forwarded_preview(&slack_msg.attachments),
+                        cards: build_cards(&slack_msg.attachments),
                         mentions_me,
                         local_echo_id: None,
                             is_edited: false,
@@ -1234,7 +1273,7 @@ impl App {
                 ts: format!("{}.local.{}", chrono::Local::now().timestamp(), local_echo_id),
                 reactions: Vec::new(),
                 reply_count: 0,
-                forwarded_text: None,
+                cards: Vec::new(),
                 mentions_me: false,
                 local_echo_id: Some(local_echo_id),
                 is_edited: false,
@@ -1519,6 +1558,18 @@ impl App {
         let rows = self.build_chat_list_rows();
         let selected_row = self.chat_idx_to_row(&rows, self.selected_chat_idx);
 
+        // The "active" chat = the one open in the currently focused pane.
+        // We highlight that (blue bg) so users always see which row matches
+        // the chat they're reading. The cursor (selected_chat_idx) gets a
+        // subtle arrow marker when the chat list is focused.
+        let active_channel_id = self
+            .panes
+            .get(self.focused_pane_idx)
+            .and_then(|p| p.channel_id_str.clone());
+        let active_chat_idx: Option<usize> = active_channel_id.as_ref().and_then(|id| {
+            self.chats.iter().position(|c| &c.id == id)
+        });
+
         // Ensure scroll offset keeps selected row visible
         if selected_row < self.chat_list_scroll_offset {
             self.chat_list_scroll_offset = selected_row;
@@ -1544,36 +1595,34 @@ impl App {
                 }
                 ChatListRow::Chat(chat_idx) => {
                     let chat = &self.chats[*chat_idx];
-                    let is_selected = *chat_idx == self.selected_chat_idx;
+                    let is_active = active_chat_idx == Some(*chat_idx);
+                    let is_cursor = *chat_idx == self.selected_chat_idx;
                     let has_activity = chat.unread > 0;
 
-                    let base_style = if is_selected {
+                    let base_style = if is_active {
                         Style::default().bg(Color::Blue).fg(Color::White)
                     } else if has_activity {
                         Style::default()
-                            .fg(Color::LightYellow)
+                            .bg(Color::Red)
+                            .fg(Color::White)
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
                     };
 
-                    let marker_style = if is_selected {
-                        Style::default()
-                            .bg(Color::Blue)
-                            .fg(Color::LightYellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                            .fg(Color::LightYellow)
-                            .add_modifier(Modifier::BOLD)
-                    };
+                    let marker_style = base_style;
 
                     let mut spans = vec![];
-                    if has_activity {
-                        spans.push(Span::styled("● ", marker_style));
+                    // Cursor indicator: arrow only when chat list is focused
+                    // and this isn't already the active row.
+                    let prefix = if is_cursor && self.focus_on_chat_list && !is_active {
+                        "▸ "
+                    } else if has_activity || is_active {
+                        "  "
                     } else {
-                        spans.push(Span::raw("  "));
-                    }
+                        "  "
+                    };
+                    spans.push(Span::styled(prefix.to_string(), base_style));
                     spans.push(Span::styled(chat.name.clone(), base_style));
                     if has_activity {
                         spans.push(Span::styled(
@@ -1696,7 +1745,12 @@ impl App {
         let mut message_lines: Vec<Line> = Vec::new();
         let mut image_overlays: Vec<(usize, String, String)> = Vec::new();
         for (idx, msg) in pane.msg_data.iter().enumerate() {
-            let name_style = if msg.is_outgoing {
+            let line_start = message_lines.len();
+            let name_style = if !show_user_colors {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else if msg.is_outgoing {
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD)
@@ -1706,19 +1760,11 @@ impl App {
                     .add_modifier(Modifier::BOLD)
             };
 
-            let formatted_text = format_message_text(&msg.text, show_emojis, &resolve_user);
+            let body_spans = format_message_spans(&msg.text, show_emojis, &resolve_user);
 
             let mut prefix_spans = Vec::new();
-
-            // Add highlight indicator if message mentions the user
-            if msg.mentions_me {
-                prefix_spans.push(Span::styled(
-                    "@ ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
+            // Mentions-me is rendered as a whole-row red highlight at the end
+            // of this iteration — no inline marker needed here.
 
             // Add deleted indicator
             if msg.is_deleted {
@@ -1744,23 +1790,24 @@ impl App {
                 ));
             }
 
-            // Use color-coded username for better visual distinction
-            let username_style = if msg.is_outgoing {
-                name_style  // Keep own messages with original style
-            } else if show_user_colors {
+            // Use color-coded username for better visual distinction.
+            // When show_user_colors is off, every nick falls through to
+            // name_style which is uniform DarkGray.
+            let username_style = if !show_user_colors {
+                name_style
+            } else if msg.is_outgoing {
+                name_style
+            } else {
                 Style::default()
                     .fg(username_color(&msg.sender_name))
                     .add_modifier(Modifier::BOLD)
-            } else {
-                name_style  // Use default style if colors are disabled
             };
             prefix_spans.push(Span::styled(
                 format!("{}: ", msg.sender_name),
                 username_style,
             ));
 
-            let mut content_spans = Vec::new();
-            content_spans.push(Span::raw(formatted_text));
+            let mut content_spans: Vec<Span<'static>> = body_spans;
 
             // Add media indicator
             if let Some(ref media_type) = msg.media_type {
@@ -1799,25 +1846,24 @@ impl App {
                 ));
             }
 
-            // Reactions inline
+            // Reactions as styled pill badges
             if show_reactions && !msg.reactions.is_empty() {
-                let reaction_str: String = msg
-                    .reactions
-                    .iter()
-                    .map(|(name, count)| {
-                        let emoji = slack_emoji_to_unicode(name);
-                        if *count > 1 {
-                            format!("{}x{}", count, emoji)
-                        } else {
-                            emoji
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                content_spans.push(Span::styled(
-                    format!("  {}", reaction_str),
-                    Style::default().fg(Color::DarkGray),
-                ));
+                content_spans.push(Span::raw("  "));
+                let pill_style = Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(60, 60, 65));
+                for (idx, (name, count)) in msg.reactions.iter().enumerate() {
+                    if idx > 0 {
+                        content_spans.push(Span::raw(" "));
+                    }
+                    let emoji = slack_emoji_to_unicode(name);
+                    let label = if *count > 1 {
+                        format!(" {} {} ", emoji, count)
+                    } else {
+                        format!(" {} ", emoji)
+                    };
+                    content_spans.push(Span::styled(label, pill_style));
+                }
             }
 
             let prefix_width = spans_width(&prefix_spans);
@@ -1837,48 +1883,83 @@ impl App {
                 message_lines.push(Line::from(line));
             }
 
-            // Show quoted/forwarded message as indented block (max 3 lines)
-            if let Some(ref fwd) = msg.forwarded_text {
-                let quote_style = Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC);
-                let quote_prefix = vec![Span::styled("│ ", quote_style)];
-                let quote_prefix_width = spans_width(&quote_prefix);
-                let quote_indent = format!("{}{}", "│ ", " ".repeat(quote_prefix_width.saturating_sub(2)));
-                let quote_first_width = msg_width.saturating_sub(quote_prefix_width);
-                let quote_rest_width =
-                    msg_width.saturating_sub(UnicodeWidthStr::width(quote_indent.as_str()));
-                let quote_spans = vec![Span::styled(fwd.as_str(), quote_style)];
-                let mut quote_lines = wrap_spans_hanging(
-                    &quote_spans,
-                    quote_first_width,
-                    quote_rest_width,
-                    quote_indent.as_str(),
-                );
-                if quote_lines.is_empty() {
-                    quote_lines.push(Vec::new());
-                }
-                if quote_lines.len() > 3 {
-                    quote_lines.truncate(3);
-                    quote_lines.push(vec![Span::styled("│ ...", quote_style)]);
-                }
-                let mut first_line = quote_prefix;
-                first_line.extend(quote_lines.remove(0));
-                message_lines.push(Line::from(first_line));
-                for line in quote_lines {
-                    message_lines.push(Line::from(line));
+            // Render attachments as compact bordered cards.
+            for card in &msg.cards {
+                let card_lines = render_card(card, msg_width, show_emojis, &resolve_user);
+                for line in card_lines {
+                    message_lines.push(line);
                 }
             }
 
-            // Reserve 8 rows for inline image preview if this message has an image attachment.
+            // Reserve rows for inline image preview if this message has an image attachment.
             if self.show_image_preview && msg.media_type.as_deref() == Some("image") && !msg.file_urls.is_empty() {
                 let url = msg.file_urls[0].clone();
                 let name = msg.file_names.first().cloned().unwrap_or_else(|| "image".to_string());
                 let abs_line = message_lines.len();
-                for _ in 0..8 {
+                for _ in 0..IMAGE_PREVIEW_ROWS {
                     message_lines.push(Line::default());
                 }
                 image_overlays.push((abs_line, url, name));
+            }
+
+            // Pad lines that contain triple-backtick code-block spans so the
+            // dark background extends across the full message width.
+            {
+                let block_bg = crate::formatting::CODE_BLOCK_BG;
+                for li in line_start..message_lines.len() {
+                    let has_block = message_lines[li]
+                        .spans
+                        .iter()
+                        .any(|s| s.style.bg == Some(block_bg));
+                    if !has_block {
+                        continue;
+                    }
+                    let line = std::mem::take(&mut message_lines[li]);
+                    let mut visible_w = 0usize;
+                    for s in &line.spans {
+                        visible_w += s
+                            .content
+                            .chars()
+                            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                            .sum::<usize>();
+                    }
+                    let mut new_spans: Vec<Span<'static>> =
+                        line.spans.into_iter().map(|s| Span::styled(s.content.into_owned(), s.style)).collect();
+                    if visible_w < msg_width {
+                        let pad = msg_width - visible_w;
+                        new_spans.push(Span::styled(
+                            " ".repeat(pad),
+                            Style::default().bg(block_bg),
+                        ));
+                    }
+                    message_lines[li] = Line::from(new_spans);
+                }
+            }
+
+            // Red-row highlight for messages that mention the user.
+            // Patches every span in the message's lines with red bg + white fg
+            // (overrides existing styles) and pads each line with red bg
+            // through to msg_width so the highlight extends past the text.
+            if msg.mentions_me {
+                let red = Style::default().bg(Color::Red).fg(Color::White);
+                for li in line_start..message_lines.len() {
+                    let line = std::mem::take(&mut message_lines[li]);
+                    let mut new_spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
+                    let mut visible_w = 0usize;
+                    for s in line.spans.into_iter() {
+                        let w: usize = s.content.chars()
+                            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                            .sum();
+                        visible_w += w;
+                        let combined = s.style.patch(red);
+                        new_spans.push(Span::styled(s.content.into_owned(), combined));
+                    }
+                    if visible_w < msg_width {
+                        let pad = msg_width - visible_w;
+                        new_spans.push(Span::styled(" ".repeat(pad), red));
+                    }
+                    message_lines[li] = Line::from(new_spans);
+                }
             }
         }
 
@@ -1903,7 +1984,7 @@ impl App {
             let scroll = scroll_offset as i32;
             for (abs_line, url, name) in &image_overlays {
                 let rel_top = *abs_line as i32 - scroll;
-                let rel_bot = rel_top + 8;
+                let rel_bot = rel_top + IMAGE_PREVIEW_ROWS as i32;
                 if rel_bot <= 0 || rel_top >= viewport_h {
                     continue;
                 }
@@ -2000,7 +2081,17 @@ impl App {
             0
         };
 
-        let input = Paragraph::new(pane.input_buffer.as_str())
+        // Live mrkdwn preview: parse the buffer into styled spans so *bold*,
+        // _italic_, ~strike~, `code`, ```blocks```, lists and quotes get
+        // rendered inline as the user types. The raw markers stay visible so
+        // the cursor positioning (which is computed against the raw buffer)
+        // remains correct.
+        let input_text = build_input_preview(
+            pane.input_buffer.as_str(),
+            self.show_emojis,
+            input_style,
+        );
+        let input = Paragraph::new(input_text)
             .style(input_style)
             .wrap(Wrap { trim: false })
             .scroll((input_scroll as u16, 0));
@@ -2545,6 +2636,12 @@ impl App {
 
     pub fn toggle_user_colors(&mut self) {
         self.show_user_colors = !self.show_user_colors;
+        let status = if self.show_user_colors {
+            "Username colors: ON"
+        } else {
+            "Username colors: OFF"
+        };
+        self.set_status(status);
         for pane in &mut self.panes {
             pane.invalidate_cache();
         }
@@ -2584,6 +2681,10 @@ impl App {
                     Some(ChatListRow::Chat(chat_idx)) => {
                         self.selected_chat_idx = *chat_idx;
                         self.pending_open_chat = true;
+                        // Single-click should open the chat and immediately
+                        // hand focus back to the pane so typing works without
+                        // a second click into the message area.
+                        self.focus_on_chat_list = false;
                     }
                     None => {}
                 }
@@ -2844,20 +2945,20 @@ impl App {
                             .map(|r| (r.name.clone(), r.count))
                             .collect();
                         let mentions_me =
-                            Self::message_mentions_user(&slack_msg.text, &self.my_user_id);
+                            Self::message_mentions_user(&slack_msg.rendered_text(), &self.my_user_id);
                         let (media_type, file_ids, file_urls, file_names) =
-                            detect_media_type(&slack_msg.files)
+                            detect_message_media(&slack_msg.files, &slack_msg.attachments)
                                 .map(|(mt, ids, urls, names)| (Some(mt), ids, urls, names))
                                 .unwrap_or((None, Vec::new(), Vec::new(), Vec::new()));
 
                         pane.msg_data.push(crate::widgets::MessageData {
                             sender_name,
-                            text: slack_msg.text.clone(),
+                            text: slack_msg.rendered_text(),
                             is_outgoing: slack_msg.user.as_deref() == Some(&self.my_user_id),
                             ts: slack_msg.ts.clone(),
                             reactions,
                             reply_count: slack_msg.reply_count.unwrap_or(0),
-                            forwarded_text: forwarded_preview(&slack_msg.attachments),
+                            cards: build_cards(&slack_msg.attachments),
                             mentions_me,
                             local_echo_id: None,
                             is_edited: false,
@@ -2926,6 +3027,174 @@ impl App {
             self.focused_pane_idx = self.panes.len() - 1;
         }
     }
+}
+
+/// Convert the raw compose-input buffer into styled lines for live preview.
+/// Each `\n` in the buffer starts a new Line; mrkdwn markers stay visible
+/// as text so cursor positions computed against the raw buffer line up.
+fn build_input_preview(buffer: &str, show_emojis: bool, base_style: Style) -> Text<'static> {
+    let resolve_noop = |s: &str| s.to_string();
+    let spans = format_message_spans(buffer, show_emojis, &resolve_noop);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    for span in spans {
+        let style = base_style.patch(span.style);
+        let content = span.content.into_owned();
+        let mut first = true;
+        for piece in content.split('\n') {
+            if !first {
+                lines.push(Line::from(std::mem::take(&mut current)));
+            }
+            first = false;
+            if !piece.is_empty() {
+                current.push(Span::styled(piece.to_string(), style));
+            }
+        }
+    }
+    lines.push(Line::from(current));
+    Text::from(lines)
+}
+
+/// Render an attachment card as a compact bordered box with a colored side bar.
+/// Layout:
+///   ╭ @author · *Title*
+///   │ pretext (italic dim)
+///   │ body line 1
+///   │ body line 2
+///   │ footer (dim)
+///   ╰
+fn render_card(
+    card: &crate::widgets::AttachmentCard,
+    width: usize,
+    show_emojis: bool,
+    resolve_user: &dyn Fn(&str) -> String,
+) -> Vec<Line<'static>> {
+    let bar_color = card
+        .color
+        .as_deref()
+        .and_then(parse_hex_color)
+        .unwrap_or(Color::Cyan);
+    let bar_style = Style::default().fg(bar_color);
+
+    let header_open: &str = "╭ ";
+    let body_bar: &str = "│ ";
+    let footer_close: &str = "╰";
+    let bar_width = UnicodeWidthStr::width(body_bar);
+    let inner_first = width.saturating_sub(bar_width).max(1);
+    let indent_str = " ".repeat(bar_width);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    // ----- header (top corner + author/title) -----
+    let mut header_spans: Vec<Span<'static>> = vec![Span::styled(header_open.to_string(), bar_style)];
+    let author = card.author.clone().filter(|s| !s.is_empty());
+    let title = card.title.clone().filter(|s| !s.is_empty());
+    if let Some(a) = author.as_ref() {
+        header_spans.push(Span::styled(
+            format!("@{}", a),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if author.is_some() && title.is_some() {
+        header_spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+    }
+    if let Some(t) = title.as_ref() {
+        // Underline the title when title_link is present, signaling clickability.
+        let mut title_style = Style::default().add_modifier(Modifier::BOLD);
+        if card.title_link.as_ref().filter(|s| !s.is_empty()).is_some() {
+            title_style = title_style.add_modifier(Modifier::UNDERLINED);
+        }
+        header_spans.push(Span::styled(t.clone(), title_style));
+    }
+    if author.is_none() && title.is_none() {
+        // Top corner only
+        header_spans.push(Span::raw(""));
+    }
+    out.push(Line::from(header_spans));
+
+    // Helper to apply a base style on top of the per-span styles produced by
+    // the markdown parser (so e.g. dim footer text still shows bold/italic markers).
+    let overlay = |spans: Vec<Span<'static>>, base: Style| -> Vec<Span<'static>> {
+        spans
+            .into_iter()
+            .map(|s| {
+                let combined = base.patch(s.style);
+                Span::styled(s.content.into_owned(), combined)
+            })
+            .collect()
+    };
+
+    // ----- pretext -----
+    if let Some(pretext) = card.pretext.as_ref().filter(|s| !s.is_empty()) {
+        let parsed = format_message_spans(pretext, show_emojis, resolve_user);
+        let base = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        let spans = overlay(parsed, base);
+        let wrapped = wrap_spans_hanging(&spans, inner_first, inner_first, &indent_str);
+        for piece in wrapped {
+            let mut line = vec![Span::styled(body_bar.to_string(), bar_style)];
+            line.extend(piece);
+            out.push(Line::from(line));
+        }
+    }
+
+    // ----- body -----
+    const MAX_BODY_LINES: usize = 24;
+    let mut body_count = 0usize;
+    let mut truncated = false;
+    'outer: for source_line in card.body.split('\n') {
+        let parsed = format_message_spans(source_line, show_emojis, resolve_user);
+        let spans: Vec<Span<'static>> = if parsed.is_empty() {
+            vec![Span::raw(String::new())]
+        } else {
+            parsed
+        };
+        let mut wrapped = wrap_spans_hanging(&spans, inner_first, inner_first, &indent_str);
+        if wrapped.is_empty() {
+            wrapped.push(Vec::new());
+        }
+        for piece in wrapped {
+            if body_count >= MAX_BODY_LINES {
+                truncated = true;
+                break 'outer;
+            }
+            let mut line = vec![Span::styled(body_bar.to_string(), bar_style)];
+            line.extend(piece);
+            out.push(Line::from(line));
+            body_count += 1;
+        }
+    }
+    if truncated {
+        let mut line = vec![Span::styled(body_bar.to_string(), bar_style)];
+        line.push(Span::styled(
+            "…".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+        out.push(Line::from(line));
+    }
+
+    // ----- footer -----
+    if let Some(footer) = card.footer.as_ref().filter(|s| !s.is_empty()) {
+        let parsed = format_message_spans(footer, show_emojis, resolve_user);
+        let base = Style::default().fg(Color::DarkGray);
+        let spans = overlay(parsed, base);
+        let wrapped = wrap_spans_hanging(&spans, inner_first, inner_first, &indent_str);
+        for piece in wrapped {
+            let mut line = vec![Span::styled(body_bar.to_string(), bar_style)];
+            line.extend(piece);
+            out.push(Line::from(line));
+        }
+    }
+
+    // ----- bottom corner -----
+    out.push(Line::from(vec![Span::styled(
+        footer_close.to_string(),
+        bar_style,
+    )]));
+
+    out
 }
 
 fn spans_width(spans: &[Span]) -> usize {

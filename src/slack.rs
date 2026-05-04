@@ -22,7 +22,10 @@ pub enum SlackUpdate {
         thread_ts: Option<String>,
         is_bot: bool,
         is_self: bool,
-        forwarded: Option<String>,
+        cards: Vec<crate::widgets::AttachmentCard>,
+        // (url, file_name) pairs from attachment.image_url — Giphy and other
+        // unfurled image attachments rendered inline.
+        inline_image_urls: Vec<(String, String)>,
         mentions_me: bool,
         files: Vec<SlackFile>,
     },
@@ -153,6 +156,39 @@ pub struct SlackMessage {
     pub attachments: Vec<SlackAttachment>,
     #[serde(default)]
     pub files: Vec<SlackFile>,
+    #[serde(default)]
+    pub blocks: Vec<SlackBlock>,
+}
+
+impl SlackMessage {
+    /// Returns the message text. Slack's own clients prefer `blocks` over the
+    /// `text` field (which is a notification fallback), so we do the same:
+    /// rendered blocks win when present, then plain text, then attachment content.
+    pub fn rendered_text(&self) -> String {
+        let from_blocks = render_blocks(&self.blocks);
+        if !from_blocks.is_empty() {
+            return from_blocks;
+        }
+        if !self.text.is_empty() {
+            return self.text.clone();
+        }
+        for att in &self.attachments {
+            let rendered = render_blocks(&att.blocks);
+            if !rendered.is_empty() {
+                return rendered;
+            }
+            if let Some(t) = att.text.as_ref().filter(|t| !t.is_empty()) {
+                return t.clone();
+            }
+            if let Some(t) = att.pretext.as_ref().filter(|t| !t.is_empty()) {
+                return t.clone();
+            }
+            if let Some(t) = att.fallback.as_ref().filter(|t| !t.is_empty()) {
+                return t.clone();
+            }
+        }
+        String::new()
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -208,22 +244,386 @@ pub struct SlackAttachment {
     #[serde(default)]
     pub author_name: Option<String>,
     #[serde(default)]
+    pub author_link: Option<String>,
+    #[serde(default)]
     pub title: Option<String>,
+    #[serde(default)]
+    pub title_link: Option<String>,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub footer: Option<String>,
+    #[serde(default)]
+    pub image_url: Option<String>,
+    #[serde(default)]
+    pub blocks: Vec<SlackBlock>,
 }
 
-fn extract_forwarded_text(attachments: &[SlackAttachment]) -> Option<String> {
-    for att in attachments {
-        if let Some(text) = att.text.as_ref().filter(|t| !t.is_empty()) {
-            return Some(text.clone());
-        }
-        if let Some(pretext) = att.pretext.as_ref().filter(|t| !t.is_empty()) {
-            return Some(pretext.clone());
-        }
-        if let Some(fallback) = att.fallback.as_ref().filter(|t| !t.is_empty()) {
-            return Some(fallback.clone());
+// ---------- Block Kit ----------
+
+#[derive(Deserialize, Serialize, Clone, Default)]
+pub struct SlackTextObject {
+    #[serde(rename = "type", default)]
+    pub obj_type: String,
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(tag = "type")]
+pub enum SlackBlock {
+    #[serde(rename = "section")]
+    Section {
+        #[serde(default)]
+        text: Option<SlackTextObject>,
+        #[serde(default)]
+        fields: Vec<SlackTextObject>,
+    },
+    #[serde(rename = "header")]
+    Header {
+        #[serde(default)]
+        text: Option<SlackTextObject>,
+    },
+    #[serde(rename = "context")]
+    Context {
+        #[serde(default)]
+        elements: Vec<SlackContextElement>,
+    },
+    #[serde(rename = "divider")]
+    Divider,
+    #[serde(rename = "rich_text")]
+    RichText {
+        #[serde(default)]
+        elements: Vec<RichTextBlock>,
+    },
+    #[serde(rename = "image")]
+    Image {
+        #[serde(default)]
+        title: Option<SlackTextObject>,
+        #[serde(default)]
+        alt_text: Option<String>,
+        #[serde(default)]
+        image_url: Option<String>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(tag = "type")]
+pub enum SlackContextElement {
+    #[serde(rename = "mrkdwn")]
+    Mrkdwn {
+        #[serde(default)]
+        text: String,
+    },
+    #[serde(rename = "plain_text")]
+    PlainText {
+        #[serde(default)]
+        text: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(tag = "type")]
+pub enum RichTextBlock {
+    #[serde(rename = "rich_text_section")]
+    Section {
+        #[serde(default)]
+        elements: Vec<RichTextElement>,
+    },
+    #[serde(rename = "rich_text_list")]
+    List {
+        #[serde(default)]
+        style: String,
+        #[serde(default)]
+        elements: Vec<RichTextBlock>,
+    },
+    #[serde(rename = "rich_text_quote")]
+    Quote {
+        #[serde(default)]
+        elements: Vec<RichTextElement>,
+    },
+    #[serde(rename = "rich_text_preformatted")]
+    Preformatted {
+        #[serde(default)]
+        elements: Vec<RichTextElement>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize, Serialize, Clone, Default)]
+pub struct RichTextStyle {
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub italic: bool,
+    #[serde(default)]
+    pub strike: bool,
+    #[serde(default)]
+    pub code: bool,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(tag = "type")]
+pub enum RichTextElement {
+    #[serde(rename = "text")]
+    Text {
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        style: RichTextStyle,
+    },
+    #[serde(rename = "link")]
+    Link {
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        text: Option<String>,
+    },
+    #[serde(rename = "emoji")]
+    Emoji {
+        #[serde(default)]
+        name: String,
+    },
+    #[serde(rename = "user")]
+    User {
+        #[serde(default)]
+        user_id: String,
+    },
+    #[serde(rename = "channel")]
+    Channel {
+        #[serde(default)]
+        channel_id: String,
+    },
+    #[serde(rename = "usergroup")]
+    UserGroup {
+        #[serde(default)]
+        usergroup_id: String,
+    },
+    #[serde(rename = "broadcast")]
+    Broadcast {
+        #[serde(default)]
+        range: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// Render a Block Kit blocks array into mrkdwn-flavored text suitable for the
+/// existing message formatter (which already handles `<@U..>`, `<#C..>`, `:emoji:`,
+/// and `<url|label>` tokens).
+pub fn render_blocks(blocks: &[SlackBlock]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for block in blocks {
+        match block {
+            SlackBlock::Section { text, fields } => {
+                if let Some(t) = text {
+                    if !t.text.is_empty() {
+                        out.push(t.text.clone());
+                    }
+                }
+                for f in fields {
+                    if !f.text.is_empty() {
+                        out.push(f.text.clone());
+                    }
+                }
+            }
+            SlackBlock::Header { text } => {
+                if let Some(t) = text {
+                    if !t.text.is_empty() {
+                        out.push(format!("*{}*", t.text));
+                    }
+                }
+            }
+            SlackBlock::Context { elements } => {
+                let mut parts = Vec::new();
+                for el in elements {
+                    match el {
+                        SlackContextElement::Mrkdwn { text }
+                        | SlackContextElement::PlainText { text } => {
+                            if !text.is_empty() {
+                                parts.push(text.clone());
+                            }
+                        }
+                        SlackContextElement::Other => {}
+                    }
+                }
+                if !parts.is_empty() {
+                    out.push(parts.join(" · "));
+                }
+            }
+            SlackBlock::Divider => {
+                out.push("─────".to_string());
+            }
+            SlackBlock::RichText { elements } => {
+                let rendered = render_rich_text(elements);
+                if !rendered.is_empty() {
+                    out.push(rendered);
+                }
+            }
+            SlackBlock::Image { title, alt_text, image_url } => {
+                let mut parts = Vec::new();
+                if let Some(t) = title {
+                    if !t.text.is_empty() {
+                        parts.push(t.text.clone());
+                    }
+                }
+                if let Some(alt) = alt_text.as_ref().filter(|s| !s.is_empty()) {
+                    parts.push(alt.clone());
+                }
+                if let Some(url) = image_url.as_ref().filter(|s| !s.is_empty()) {
+                    parts.push(format!("<{}>", url));
+                }
+                if !parts.is_empty() {
+                    out.push(format!("[image] {}", parts.join(" — ")));
+                }
+            }
+            SlackBlock::Other => {}
         }
     }
-    None
+    out.join("\n")
+}
+
+fn render_rich_text(blocks: &[RichTextBlock]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for block in blocks {
+        match block {
+            RichTextBlock::Section { elements } => {
+                let s = render_rich_elements(elements);
+                if !s.is_empty() {
+                    out.push(s);
+                }
+            }
+            RichTextBlock::List { style, elements } => {
+                let bullet_style = style.as_str();
+                for (i, item) in elements.iter().enumerate() {
+                    let inner = match item {
+                        RichTextBlock::Section { elements } => render_rich_elements(elements),
+                        other => render_rich_text(std::slice::from_ref(other)),
+                    };
+                    let prefix = if bullet_style == "ordered" {
+                        format!("{}. ", i + 1)
+                    } else {
+                        "• ".to_string()
+                    };
+                    out.push(format!("{}{}", prefix, inner));
+                }
+            }
+            RichTextBlock::Quote { elements } => {
+                let s = render_rich_elements(elements);
+                for line in s.lines() {
+                    out.push(format!("> {}", line));
+                }
+            }
+            RichTextBlock::Preformatted { elements } => {
+                let s = render_rich_elements(elements);
+                out.push(format!("```\n{}\n```", s));
+            }
+            RichTextBlock::Other => {}
+        }
+    }
+    out.join("\n")
+}
+
+fn render_rich_elements(elements: &[RichTextElement]) -> String {
+    let mut s = String::new();
+    for el in elements {
+        match el {
+            RichTextElement::Text { text, style } => {
+                let mut piece = text.clone();
+                if style.code {
+                    piece = format!("`{}`", piece);
+                }
+                if style.bold {
+                    piece = format!("*{}*", piece);
+                }
+                if style.italic {
+                    piece = format!("_{}_", piece);
+                }
+                if style.strike {
+                    piece = format!("~{}~", piece);
+                }
+                s.push_str(&piece);
+            }
+            RichTextElement::Link { url, text } => {
+                if let Some(label) = text.as_ref().filter(|t| !t.is_empty()) {
+                    s.push_str(&format!("<{}|{}>", url, label));
+                } else {
+                    s.push_str(&format!("<{}>", url));
+                }
+            }
+            RichTextElement::Emoji { name } => {
+                s.push_str(&format!(":{}:", name));
+            }
+            RichTextElement::User { user_id } => {
+                s.push_str(&format!("<@{}>", user_id));
+            }
+            RichTextElement::Channel { channel_id } => {
+                s.push_str(&format!("<#{}>", channel_id));
+            }
+            RichTextElement::UserGroup { usergroup_id } => {
+                s.push_str(&format!("<!subteam^{}>", usergroup_id));
+            }
+            RichTextElement::Broadcast { range } => {
+                s.push_str(&format!("<!{}>", range));
+            }
+            RichTextElement::Other => {}
+        }
+    }
+    s
+}
+
+/// Convert Slack attachments into structured cards for boxed UI rendering.
+/// Each card carries author/title/body/footer separately so the renderer can
+/// style each piece distinctly.
+pub fn attachments_to_cards(attachments: &[SlackAttachment]) -> Vec<crate::widgets::AttachmentCard> {
+    let mut out = Vec::new();
+    for att in attachments {
+        let body = if !att.blocks.is_empty() {
+            let rendered = render_blocks(&att.blocks);
+            if !rendered.is_empty() {
+                rendered
+            } else {
+                att.text.clone().unwrap_or_default()
+            }
+        } else if let Some(text) = att.text.as_ref().filter(|t| !t.is_empty()) {
+            text.clone()
+        } else if let Some(fallback) = att.fallback.as_ref().filter(|t| !t.is_empty()) {
+            // Only use fallback when nothing else is available.
+            if fallback.len() > 400 {
+                format!("{}...", &fallback[..400])
+            } else {
+                fallback.clone()
+            }
+        } else {
+            String::new()
+        };
+
+        // Skip a card that has no displayable content at all.
+        if body.is_empty()
+            && att.author_name.as_ref().map_or(true, |s| s.is_empty())
+            && att.title.as_ref().map_or(true, |s| s.is_empty())
+            && att.pretext.as_ref().map_or(true, |s| s.is_empty())
+            && att.footer.as_ref().map_or(true, |s| s.is_empty())
+        {
+            continue;
+        }
+
+        out.push(crate::widgets::AttachmentCard {
+            color: att.color.clone().filter(|s| !s.is_empty()),
+            author: att.author_name.clone().filter(|s| !s.is_empty()),
+            title: att.title.clone().filter(|s| !s.is_empty()),
+            title_link: att.title_link.clone().filter(|s| !s.is_empty()),
+            pretext: att.pretext.clone().filter(|s| !s.is_empty()),
+            body,
+            footer: att.footer.clone().filter(|s| !s.is_empty()),
+        });
+    }
+    out
 }
 
 /// Check if the text contains a mention of the specified user ID
@@ -574,11 +974,14 @@ impl SlackClient {
                     }
                     
                     // Regular new message
-                    if let (Some(channel_id), Some(text), Some(ts)) = (
+                    if let (Some(channel_id), Some(ts)) = (
                         event.get("channel").and_then(|v| v.as_str()),
-                        event.get("text").and_then(|v| v.as_str()),
                         event.get("ts").and_then(|v| v.as_str()),
                     ) {
+                        let raw_text = event
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         let user_id_event = event
                             .get("user")
                             .and_then(|v| v.as_str())
@@ -592,7 +995,53 @@ impl SlackClient {
                             .get("attachments")
                             .and_then(|a| serde_json::from_value(a.clone()).ok())
                             .unwrap_or_default();
-                        let forwarded = extract_forwarded_text(&attachments);
+                        let blocks: Vec<SlackBlock> = event
+                            .get("blocks")
+                            .and_then(|b| serde_json::from_value(b.clone()).ok())
+                            .unwrap_or_default();
+                        // Prefer rendered blocks over raw text (matches Slack client behavior).
+                        let from_blocks = render_blocks(&blocks);
+                        let text_owned = if !from_blocks.is_empty() {
+                            from_blocks
+                        } else if !raw_text.is_empty() {
+                            raw_text.to_string()
+                        } else {
+                            attachments
+                                .iter()
+                                .find_map(|a| {
+                                    let r = render_blocks(&a.blocks);
+                                    if !r.is_empty() {
+                                        Some(r)
+                                    } else {
+                                        a.text
+                                            .clone()
+                                            .or_else(|| a.pretext.clone())
+                                            .or_else(|| a.fallback.clone())
+                                            .filter(|t| !t.is_empty())
+                                    }
+                                })
+                                .unwrap_or_default()
+                        };
+                        let text = text_owned.as_str();
+                        if text.is_empty() && attachments.is_empty() && blocks.is_empty() {
+                            return;
+                        }
+                        let cards = attachments_to_cards(&attachments);
+                        let inline_image_urls: Vec<(String, String)> = attachments
+                            .iter()
+                            .filter_map(|a| {
+                                a.image_url.as_ref().filter(|s| !s.is_empty()).map(|u| {
+                                    let name = u
+                                        .rsplit('/')
+                                        .next()
+                                        .and_then(|s| s.split('?').next())
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or("image")
+                                        .to_string();
+                                    (u.clone(), name)
+                                })
+                            })
+                            .collect();
 
                         let my_id = user_id.lock().await.clone().unwrap_or_default();
                         let is_self = !my_id.is_empty() && user_id_event == my_id;
@@ -666,7 +1115,8 @@ impl SlackClient {
                             thread_ts,
                             is_bot,
                             is_self,
-                            forwarded,
+                            cards,
+                            inline_image_urls,
                             mentions_me,
                             files,
                         });
