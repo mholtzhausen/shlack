@@ -1,5 +1,9 @@
 # slack_rust
 
+[![Rust](https://img.shields.io/badge/rust-stable-DEA584.svg)](https://www.rust-lang.org/)
+[![ratatui](https://img.shields.io/badge/tui-ratatui-blue.svg)](https://ratatui.rs)
+[![Docs](https://img.shields.io/badge/docs-mkdocs--material-blue.svg)](https://stevoo.net/slack_rust/)
+
 terminal-native slack client built with rust and [ratatui](https://ratatui.rs).
 multi-workspace, multi-pane, real-time via socket mode, with inline image previews via the
 kitty graphics protocol. lightweight: ~11 MB RAM and well under 1% CPU at idle.
