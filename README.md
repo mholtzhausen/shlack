@@ -8,7 +8,7 @@ terminal-native slack client built with rust and [ratatui](https://ratatui.rs).
 multi-workspace, multi-pane, real-time via socket mode, with inline image previews via the
 kitty graphics protocol. lightweight: ~11 MB RAM and well under 1% CPU at idle.
 
-![layout mockup](docs/screenshot.svg)
+![](docs/screenshot.svg)
 
 ```
 == features ==
@@ -16,19 +16,25 @@ kitty graphics protocol. lightweight: ~11 MB RAM and well under 1% CPU at idle.
 multi-workspace   configure + switch many workspaces; Ctrl+1..9 quick switch;
                   Ctrl+N or /workspace to list; per-workspace state; auto-migrates
                   old single-workspace configs
+
 split / panes     split vertical (Ctrl+V) or horizontal (Ctrl+B); per-pane focus,
                   scroll, input; mouse focus; toggle direction (Ctrl+K), close
                   (Ctrl+W), clear (Ctrl+L); collapsible sidebar (Ctrl+S)
+
 real-time         live updates across panes via socket mode; typing indicators;
                   desktop notifications; auto-refresh; threads in panes (/thread,/t)
+
 channel list      "new" section for unread on top; public / private / group / dm /
                   bots sections; unread badges + red highlight; arrows + enter
+
 display           emoji rendering (Ctrl+O), reactions (Ctrl+E, /react), timestamps
                   (Ctrl+T), line numbers (Ctrl+G), compact (Ctrl+D), colour-coded
                   usernames (Ctrl+U), borderless (Ctrl+Y), mouse (Ctrl+M), [img]/
                   [video] markers, inline kitty image preview (Ctrl+P, lazy + cached)
+
 persistence       layout/splits, open chats, display settings, aliases
                   (~/.config/slack_client_rs/aliases.json), per-pane scroll
+
 extras            filter by sender/media/link, @-mention tab completion, multi-line
                   input (Shift+Enter), reply context, forwarded messages, user cache
 ```
@@ -37,9 +43,11 @@ extras            filter by sender/media/link, @-mention tab completion, multi-l
 == prerequisites ==
 
 - rust 1.70+ (rustup recommended)
+
 - a terminal with 256+ colours. inline image previews need the kitty graphics protocol
   (kitty, wezterm, ghostty, or an iterm2-compatible terminal). without it, image messages
   still show the [img] marker and /media #N works.
+
 - a slack app with socket mode enabled:
   - app-level token with connections:write scope (xapp-...)
   - user oauth token (xoxp-...) or bot user oauth token (xoxb-...); either is accepted,
@@ -50,16 +58,22 @@ extras            filter by sender/media/link, @-mention tab completion, multi-l
 == slack app setup ==
 
 1. api.slack.com/apps -> create or select an app
+
 2. settings -> socket mode -> enable
+
 3. generate an app-level token with connections:write
+
 4. oauth & permissions -> add scopes:
    channels:history channels:read chat:write groups:history groups:read
    im:history im:read mpim:history mpim:read reactions:write users:read
    (no extra file scopes: /media uses file urls from message metadata)
+
 5. features -> event subscriptions -> enable events, subscribe to:
    message.channels message.groups message.im message.mpim  (edits/deletes included)
    user_typing (optional, typing indicators).  socket mode needs no request url.
+
 6. reinstall the app to the workspace after adding events
+
 7. copy the bot/user token + app token
 ```
 
@@ -140,10 +154,14 @@ src/
 == troubleshooting ==
 
 connection      verify tokens in slack_config.json; socket mode enabled; oauth scopes ok
+
 no messages     Ctrl+R to refresh; app added to private channels; channels:history +
                 groups:history scopes present
+
 shortcuts       ensure the terminal passes Ctrl combos through; try short forms (/h)
+
 display         bigger terminal for multi-pane; Ctrl+D compact; Ctrl+S hide list
+
 image preview   needs a kitty-graphics terminal; on probe failure it logs and falls back
                 to [img]; toggle Ctrl+P (persisted as show_image_preview); /media #N
                 downloads to ./store/ and opens with the os default app
