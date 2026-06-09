@@ -1,4 +1,34 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
 
-# mkdocs site build
+# MkDocs (generated from root markdown via scripts/docs.sh)
 /site
 /docs/*.md
+
+# Local Slack credentials and runtime state (example config is tracked)
+config/slack_config.json
+config/layout_*.json
+config/aliases.json
+config/settings.json
+config/threads.json
+
+# Secrets / env
+.env
+.env.*
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug / profiling
+*.prof
+flamegraph.svg
