@@ -11,11 +11,15 @@ Read [AGENTS.md](AGENTS.md) for full architecture. This is a **Rust ratatui TUI*
 
 | Change type | Primary file |
 |-------------|--------------|
-| Keybindings, event loop | `src/main.rs` |
-| UI, pane/workspace logic | `src/app.rs` |
-| Slack API / Socket Mode | `src/slack.rs` |
+| Domain types | `src/models.rs` |
+| Message convert/apply | `src/messages.rs`, `src/events.rs` |
+| UI drawing | `src/ui/` |
+| Keybindings / compose input | `src/input.rs` |
+| Event loop / startup | `src/main.rs` |
+| Workspace / pane orchestration | `src/app.rs` |
+| Slack API / Socket Mode | `src/slack/` |
 | Slash commands | `src/commands.rs` |
-| Message rendering | `src/formatting.rs` |
+| Message rendering (mrkdwn) | `src/formatting.rs` |
 | Pane data structures | `src/widgets.rs` |
 | Split layout tree | `src/split_view.rs` |
 | Disk persistence | `src/persistence.rs` |
@@ -37,10 +41,10 @@ cargo build --release
 cargo test
 ```
 
-Tests exist in `formatting.rs` and `split_view.rs` only.
+Unit tests in `messages.rs`, `events.rs`, `formatting.rs`, `split_view.rs`, `persistence.rs`.
 
 ## Adding features
 
-- **Toggle:** `Settings` → `App` field → Ctrl+key in `main.rs` → draw logic in `app.rs` → persist in `save_state()`.
+- **Toggle:** `AppSettings` field → Ctrl+key in `input.rs` → draw in `ui/` → persisted via `App.settings`.
 - **Slash cmd:** `commands.rs` match arm + help text.
-- **Realtime event:** `SlackUpdate` variant → WS parser in `slack.rs` → `process_slack_events()` in `app.rs`.
+- **Realtime event:** `SlackUpdate` variant → `slack/socket.rs` → `events::apply_update()`.

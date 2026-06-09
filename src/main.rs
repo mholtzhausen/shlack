@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -9,11 +9,16 @@ use std::io;
 
 mod app;
 mod commands;
+mod events;
 mod config;
 mod formatting;
+mod input;
+mod messages;
+mod models;
 mod persistence;
 mod slack;
 mod split_view;
+mod ui;
 mod utils;
 mod widgets;
 
@@ -21,6 +26,10 @@ use app::App;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     // Create app BEFORE entering TUI mode (so authentication can work)
     let mut app = App::new().await?;
 
@@ -165,219 +174,13 @@ async fn run_app<B: ratatui::backend::Backend + std::io::Write>(
             let event = event::read()?;
             match event {
                 Event::Key(key) => {
-                    match key.code {
-                        // Ctrl+Q: Quit
-                        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.save_state()?;
-                            break;
-                        }
-                        // Ctrl+R: Refresh chats
-                        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.refresh_chats().await?;
-                        }
-                        // Ctrl+V: Split vertical
-                        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.split_vertical();
-                        }
-                        // Ctrl+B: Split horizontal
-                        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.split_horizontal();
-                        }
-                        // Ctrl+K: Toggle split direction
-                        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.toggle_split_direction();
-                        }
-                        // Ctrl+W: Close pane
-                        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.close_pane();
-                        }
-                        // Ctrl+S: Toggle chat list (Sidebar)
-                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.toggle_chat_list();
-                        }
-                        // Ctrl+L: Clear pane
-                        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.clear_pane();
-                        }
-                        // Ctrl+E: Toggle reactions
-                        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.toggle_reactions();
-                        }
-                        // Ctrl+O: Toggle emojis
-                        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.toggle_emojis();
-                        }
-                        // Ctrl+P: Toggle inline image preview.
-                        // Some terminals report Ctrl+P as DC1 ('\u{10}') without CONTROL modifier.
-                        KeyCode::Char('p')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            app.toggle_image_preview();
-                        }
-                        KeyCode::Char('\u{10}') => {
-                            app.toggle_image_preview();
-                        }
-                        // Ctrl+T: Toggle timestamps
-                        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.toggle_timestamps();
-                        }
-                        // Ctrl+D: Toggle compact mode
-                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.toggle_compact_mode();
-                        }
-                        // Ctrl+G: Toggle line numbers
-                        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.toggle_line_numbers();
-                        }
-                        // Ctrl+U: Toggle user colors
-                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.toggle_user_colors();
-                        }
-                        // Ctrl+Y: Toggle borders
-                        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.toggle_borders();
-                        }
-                        // Ctrl+M: Toggle mouse support
-                        KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.toggle_mouse_support();
-                        }
-                        // Ctrl+N: Show workspace list
-                        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.show_workspace_list();
-                        }
-                        // Ctrl+1-9: Switch to workspace
-                        KeyCode::Char(c @ '1'..='9') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let workspace_idx = (c as u8 - b'1') as usize;
-                            app.switch_workspace(workspace_idx);
-                        }
-                        // Tab: Next pane / Switch to chat list
-                        KeyCode::Tab => {
-                            if !app.focus_on_chat_list
-                                && !app.panes[app.focused_pane_idx].input_buffer.is_empty()
-                            {
-                                app.tab_complete();
-                            } else {
-                                app.next_pane();
-                            }
-                        }
-                        // Enter: Send message (when focus on chat pane)
-                        // Shift+Enter: Insert newline
-                        KeyCode::Enter if !app.focus_on_chat_list => {
-                            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                app.input_newline();
-                            } else {
-                                app.send_message().await?;
-                            }
-                        }
-                        // Enter: Open chat or thread (when focus on chat list)
-                        KeyCode::Enter if app.focus_on_chat_list => {
-                            if let Some(idx) = app.selected_thread_idx {
-                                app.pending_open_thread = Some(idx);
-                                app.open_pending_thread().await?;
-                            } else {
-                                app.open_selected_chat().await?;
-                            }
-                        }
-                        // Space: Toggle collapse of the section containing the selected chat
-                        KeyCode::Char(' ') if app.focus_on_chat_list => {
-                            app.toggle_selected_section();
-                        }
-                        // Shift+Up/Down: Always scroll messages
-                        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            app.scroll_up();
-                        }
-                        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            app.scroll_down();
-                        }
-                        // Up/Down: Navigate pane or chat list
-                        KeyCode::Up => {
-                            if app.focus_on_chat_list {
-                                app.select_previous_chat();
-                            } else {
-                                if app.panes[app.focused_pane_idx].input_buffer.is_empty() {
-                                    app.scroll_up();
-                                } else {
-                                    app.move_cursor_up();
-                                }
-                            }
-                        }
-                        KeyCode::Down => {
-                            if app.focus_on_chat_list {
-                                app.select_next_chat();
-                            } else {
-                                if app.panes[app.focused_pane_idx].input_buffer.is_empty() {
-                                    app.scroll_down();
-                                } else {
-                                    app.move_cursor_down();
-                                }
-                            }
-                        }
-                        // Page Up/Down: Scroll faster
-                        KeyCode::PageUp => {
-                            if !app.focus_on_chat_list {
-                                app.page_up();
-                            }
-                        }
-                        KeyCode::PageDown => {
-                            if !app.focus_on_chat_list {
-                                app.page_down();
-                            }
-                        }
-                        // Home/End: Move cursor to line start/end or jump to top/bottom (Ctrl)
-                        KeyCode::Home => {
-                            if !app.focus_on_chat_list {
-                                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                    app.scroll_to_top();
-                                } else {
-                                    app.move_cursor_home();
-                                }
-                            }
-                        }
-                        KeyCode::End => {
-                            if !app.focus_on_chat_list {
-                                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                    app.scroll_to_bottom();
-                                } else {
-                                    app.move_cursor_end();
-                                }
-                            }
-                        }
-                        // Backspace: Delete character
-                        KeyCode::Backspace if !app.focus_on_chat_list => {
-                            app.backspace();
-                        }
-                        // Delete: Delete character forward
-                        KeyCode::Delete if !app.focus_on_chat_list => {
-                            app.delete_forward();
-                        }
-                        // Ctrl+Left/Right: Resize chat list
-                        KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.resize_chat_list(-2);
-                        }
-                        KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.resize_chat_list(2);
-                        }
-                        // Left/Right: Move cursor
-                        KeyCode::Left if !app.focus_on_chat_list => {
-                            app.move_cursor_left();
-                        }
-                        KeyCode::Right if !app.focus_on_chat_list => {
-                            app.move_cursor_right();
-                        }
-                        // Esc: Clear input or cancel reply
-                        KeyCode::Esc => {
-                            app.cancel_reply();
-                        }
-                        // Character input (only when no control modifier)
-                        KeyCode::Char(c) if !app.focus_on_chat_list && !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.input_char(c);
-                        }
-                        _ => {}
+                    if input::handle_key(app, key).await? {
+                        break;
                     }
                 }
                 Event::Mouse(mouse_event) => {
                     // Only handle mouse events if mouse support is enabled
-                    if !app.mouse_support {
+                    if !app.settings.mouse_support {
                         continue;
                     }
                     

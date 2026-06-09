@@ -21,8 +21,13 @@ CI (`.github/workflows/rust.yml`) runs `cargo build` and `cargo test` on push/PR
 ```
 main.rs          Event loop: crossterm input, terminal draw, async polls
     │
-    ├── app.rs           App state, UI rendering (ratatui), workspace/pane logic
-    ├── slack.rs         HTTP API (reqwest) + Socket Mode WebSocket (tokio-tungstenite)
+    ├── app.rs           App orchestration: workspace, panes, save_state, async loads
+    ├── models.rs        ChatInfo, ChatSection, ThreadInfo (shared domain types)
+    ├── messages.rs      SlackMessage → MessageData conversion + media detection
+    ├── events.rs        Apply SlackUpdate variants to App state
+    ├── input.rs         Keybindings and compose-buffer editing
+    ├── ui/              Chat list, pane, layout drawing (ratatui)
+    ├── slack/           HTTP API, Socket Mode, Block Kit, file download
     ├── widgets.rs       ChatPane, MessageData, filters, attachment cards
     ├── split_view.rs    PaneNode tree for split layouts (serde-persisted)
     ├── commands.rs      Slash-command parsing and handlers
@@ -35,25 +40,43 @@ main.rs          Event loop: crossterm input, terminal draw, async polls
 ### Event flow
 
 1. **Startup** (`main.rs`): `App::new()` authenticates and connects Socket Mode *before* entering raw TUI mode. Kitty graphics picker is probed via stdio, then terminal alt-screen is entered.
-2. **Loop**: Poll Slack updates → poll async completions (workspace switch, chat load, image load) → expiry timers (typing, status) → resize detection → draw if `needs_redraw` → handle keyboard/mouse.
+2. **Loop**: Poll Slack updates → `events::apply_update` → poll async completions (workspace switch, chat load, image load) → expiry timers (typing, status) → resize detection → draw if `needs_redraw` → `input::handle_key`.
 3. **Shutdown**: Save state, shutdown WebSocket, restore terminal.
 
-Real-time messages arrive as `SlackUpdate` variants in `slack.rs` and are drained by `App::process_slack_events()`.
+Real-time messages arrive as `SlackUpdate` variants from `slack/socket.rs` and are drained by `App::process_slack_events()` → `events::apply_update()`.
 
 ### Key types
 
 | Module | Type | Role |
 |--------|------|------|
 | `app.rs` | `App` | Central state: panes, chats, settings, caches, async channels |
-| `app.rs` | `ChatInfo`, `ThreadInfo`, `ChatSection` | Sidebar channel/thread metadata |
+| `models.rs` | `ChatInfo`, `ThreadInfo`, `ChatSection` | Sidebar channel/thread metadata |
 | `widgets.rs` | `ChatPane` | Per-pane messages, scroll, input, filters, render cache |
 | `widgets.rs` | `MessageData` | Raw message metadata for formatting and `/media` |
 | `split_view.rs` | `PaneNode` | Binary tree of splits; maps to `App.panes` indices |
-| `slack.rs` | `SlackClient` | HTTP + background WS task; `pending_updates` queue |
-| `slack.rs` | `SlackUpdate` | New/changed/deleted message, typing indicator |
+| `slack/` | `SlackClient` | HTTP + background WS task; `pending_updates` queue |
+| `slack/types.rs` | `SlackUpdate` | New/changed/deleted message, typing indicator |
 | `config.rs` | `Config`, `Workspace`, `Settings` | Tokens, workspaces, display defaults |
-| `persistence.rs` | `LayoutData`, `PaneState` | Serialized pane layout per workspace |
+| `persistence.rs` | `LayoutData`, `PaneState`, `AppSettings` | Serialized pane layout and toggles |
 | `commands.rs` | `CommandHandler` | `/thread`, `/react`, `/filter`, `/workspace`, etc. |
+
+## Module ownership (where to edit)
+
+| Change type | Primary file |
+|-------------|--------------|
+| Domain types | `src/models.rs` |
+| Message convert/apply | `src/messages.rs`, `src/events.rs` |
+| UI drawing | `src/ui/` |
+| Keybindings / compose input | `src/input.rs` |
+| Event loop / startup | `src/main.rs` |
+| Workspace / pane orchestration | `src/app.rs` |
+| Slack API / Socket Mode | `src/slack/` |
+| Slash commands | `src/commands.rs` |
+| Message rendering (mrkdwn) | `src/formatting.rs` |
+| Pane data structures | `src/widgets.rs` |
+| Split layout tree | `src/split_view.rs` |
+| Disk persistence | `src/persistence.rs` |
+| Config / setup | `src/config.rs` |
 
 ## Configuration
 
@@ -101,8 +124,11 @@ Handled in `commands.rs` when input starts with `/`:
 
 Unit tests live in:
 
+- `src/messages.rs` — message conversion, mentions, media detection
+- `src/events.rs` — thread reply / unread / debounced-save helpers
 - `src/split_view.rs` — pane tree split/close/layout
 - `src/formatting.rs` — emoji, mentions, link conversion
+- `src/persistence.rs` — AppSettings serde round-trip
 
 No integration tests; manual testing requires valid Slack tokens.
 
@@ -123,11 +149,11 @@ Release profile: LTO, `opt-level = 3`, stripped binary.
 
 ## Common change patterns
 
-**Add a display toggle:** Add field to `Settings` + `App`, wire Ctrl+key in `main.rs`, persist in `save_state()`, use in `app.rs` draw path.
+**Add a display toggle:** Add field to `AppSettings` in `persistence.rs`, wire Ctrl+key in `input.rs`, use in `ui/` draw path; `App.settings` is persisted via `save_state()`.
 
 **Add a slash command:** Parse in `CommandHandler::handle_command`, implement handler, update `/help` text.
 
-**Handle new Slack event:** Extend `SlackUpdate`, parse in WS loop in `slack.rs`, handle in `App::process_slack_events()`.
+**Handle new Slack event:** Extend `SlackUpdate` in `slack/types.rs`, parse in `slack/socket.rs`, handle in `events::apply_update()`.
 
 **New pane state field:** Add to `ChatPane`, `PaneState` in `persistence.rs`, load/save in `App::save_state` / layout restore.
 

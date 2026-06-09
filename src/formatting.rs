@@ -1,5 +1,8 @@
 use once_cell::sync::Lazy;
+use ratatui::style::Color;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 static SLACK_EMOJI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
@@ -752,6 +755,34 @@ fn extract_chip_spans(spans: Vec<ratatui::text::Span<'static>>) -> Vec<ratatui::
         }
     }
     out
+}
+
+/// Generate a consistent color for a username using a hash function.
+pub fn username_color(username: &str) -> Color {
+    let colors = [
+        Color::Cyan,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::LightCyan,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightBlue,
+        Color::LightMagenta,
+        Color::Rgb(255, 165, 0),
+        Color::Rgb(147, 112, 219),
+        Color::Rgb(64, 224, 208),
+        Color::Rgb(255, 105, 180),
+        Color::Rgb(50, 205, 50),
+        Color::Rgb(255, 215, 0),
+    ];
+
+    let mut hasher = DefaultHasher::new();
+    username.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    colors[(hash as usize) % colors.len()]
 }
 
 #[cfg(test)]

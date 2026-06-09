@@ -264,6 +264,21 @@ fn default_true() -> bool {
     true
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_settings_default_roundtrip() {
+        let settings = AppSettings::default();
+        let json = serde_json::to_string(&settings).unwrap();
+        let parsed: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.show_reactions, settings.show_reactions);
+        assert_eq!(parsed.show_chat_list, settings.show_chat_list);
+        assert_eq!(parsed.collapsed_sections, settings.collapsed_sections);
+    }
+}
+
 impl AppState {
     pub fn load(config: &Config) -> Result<Self> {
         // Try to load settings from a separate file, fallback to config
