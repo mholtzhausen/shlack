@@ -1,8 +1,8 @@
-# slack_rust
+# shlack
 
 [![Rust](https://img.shields.io/badge/rust-stable-DEA584.svg)](https://www.rust-lang.org/)
 [![ratatui](https://img.shields.io/badge/tui-ratatui-blue.svg)](https://ratatui.rs)
-[![Docs](https://img.shields.io/badge/docs-mkdocs--material-blue.svg)](https://stevoo.net/slack_rust/)
+[![Docs](https://img.shields.io/badge/docs-mkdocs--material-blue.svg)](https://stevoo.net/shlack/)
 
 terminal-native slack client built with rust and [ratatui](https://ratatui.rs).
 multi-workspace, multi-pane, real-time via socket mode, with inline image previews via the
@@ -33,7 +33,7 @@ display           emoji rendering (Ctrl+O), reactions (Ctrl+E, /react), timestam
                   [video] markers, inline kitty image preview (Ctrl+P, lazy + cached)
 
 persistence       layout/splits, open chats, display settings, aliases
-                  (~/.config/slack_client_rs/aliases.json), per-pane scroll
+                  (~/.config/shlack/aliases.json), per-pane scroll
 
 extras            filter by sender/media/link, @-mention tab completion, multi-line
                   input (Shift+Enter), reply context, forwarded messages, user cache
@@ -79,15 +79,15 @@ extras            filter by sender/media/link, @-mention tab completion, multi-l
 
 ```bash
 # quick start
-git clone <repo> slack_rust
-cd slack_rust
+git clone <repo> shlack
+cd shlack
 cargo build --release          # or ./build.sh
-./target/release/slack_client_rs
+./target/release/shlack
 ```
 
 first run prompts for workspace name, bot token (xoxb-) or user token (xoxp-), and app
 token (xapp-). add more workspaces by editing the config or rerunning setup. config lives
-in ~/.config/slack_client_rs/: slack_config.json (workspaces/tokens/settings),
+in ~/.config/shlack/: slack_config.json (workspaces/tokens/settings),
 layout.json (panes + open channels), aliases.json (text aliases).
 
 ```

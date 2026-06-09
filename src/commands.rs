@@ -302,7 +302,7 @@ impl CommandHandler {
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/tmp/slack_rust_debug.log")
+                .open("/tmp/shlack_debug.log")
             {
                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
                 let _ = writeln!(file, "[{}] {}", timestamp, msg);

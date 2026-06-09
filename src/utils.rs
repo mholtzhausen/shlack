@@ -22,17 +22,17 @@ pub fn send_desktop_notification_ex(title: &str, message: &str, urgency: &str) {
             "low" | "normal" | "critical" => urgency,
             _ => "normal",
         };
-        // `--category=im.received` and `--hint=string:desktop-entry:slack-client`
+        // `--category=im.received` and `--hint=string:desktop-entry:shlack`
         // help notification daemons (Dunst, GNOME Shell, KDE) group/route the
         // popup correctly and show it in the persistent notification list.
         // `--icon=mail-message-new` gives a sensible default icon.
         let _ = Command::new("notify-send")
-            .arg("--app-name=Slack Client")
+            .arg("--app-name=shlack")
             .arg(format!("--urgency={}", urgency))
             .arg("--expire-time=8000")
             .arg("--category=im.received")
             .arg("--icon=mail-message-new")
-            .arg("--hint=string:desktop-entry:slack-client")
+            .arg("--hint=string:desktop-entry:shlack")
             .arg(title)
             .arg(message)
             .output();

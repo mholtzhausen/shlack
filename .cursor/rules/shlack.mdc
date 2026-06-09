@@ -1,0 +1,46 @@
+---
+description: shlack — Rust TUI Slack client conventions
+alwaysApply: true
+---
+
+# shlack Project Rules
+
+Read [AGENTS.md](AGENTS.md) for full architecture. This is a **Rust ratatui TUI** Slack client (`shlack`), not a web app.
+
+## Module ownership
+
+| Change type | Primary file |
+|-------------|--------------|
+| Keybindings, event loop | `src/main.rs` |
+| UI, pane/workspace logic | `src/app.rs` |
+| Slack API / Socket Mode | `src/slack.rs` |
+| Slash commands | `src/commands.rs` |
+| Message rendering | `src/formatting.rs` |
+| Pane data structures | `src/widgets.rs` |
+| Split layout tree | `src/split_view.rs` |
+| Disk persistence | `src/persistence.rs` |
+| Config / setup | `src/config.rs` |
+
+## Coding conventions
+
+- **Minimal diffs** — match existing style; no new abstractions for one-off use.
+- **Redraw flag** — set `needs_redraw = true` after state changes; avoid redundant `terminal.draw` calls.
+- **Monotonic time** — use `std::time::Instant` for durations/expiry (typing, status), not `SystemTime`.
+- **Async** — Slack I/O is `tokio`; heavy work off the hot path; use existing `oneshot`/`mpsc` patterns for background loads.
+- **Serde** — config and layout are JSON; add `#[serde(default)]` for new optional fields.
+- **No secrets** — never hardcode or commit tokens; config lives in `config/` or `~/.config/shlack/`.
+
+## Build & verify
+
+```bash
+cargo build --release
+cargo test
+```
+
+Tests exist in `formatting.rs` and `split_view.rs` only.
+
+## Adding features
+
+- **Toggle:** `Settings` → `App` field → Ctrl+key in `main.rs` → draw logic in `app.rs` → persist in `save_state()`.
+- **Slash cmd:** `commands.rs` match arm + help text.
+- **Realtime event:** `SlackUpdate` variant → WS parser in `slack.rs` → `process_slack_events()` in `app.rs`.

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "Building Slack Client (Rust TUI)..."
+echo "Building shlack..."
 echo "===================================="
 
 # Build in release mode for maximum performance
@@ -9,4 +9,4 @@ cargo build --release
 
 echo ""
 echo "Build complete!"
-echo "Run with: ./target/release/slack_client_rs"
+echo "Run with: ./target/release/shlack"

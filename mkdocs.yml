@@ -1,5 +1,5 @@
-site_name: slack_rust
-site_url: https://oovets.github.io/slack_rust/
+site_name: shlack
+site_url: https://oovets.github.io/shlack/
 # repo button intentionally omitted so the header shows only the site title.
 
 docs_dir: docs

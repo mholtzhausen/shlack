@@ -250,7 +250,7 @@ impl Config {
     fn create_new(config_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&config_dir)?;
 
-        println!("=== Slack Client Setup ===");
+        println!("=== shlack Setup ===");
         println!("Get your Token from https://api.slack.com/apps");
         println!("You need:");
         println!("  1. User OAuth Token (xoxp-...) or Bot User OAuth Token (xoxb-...)");
@@ -320,7 +320,43 @@ impl Config {
 
         // Last resort: use home directory
         let home = dirs::home_dir().expect("Cannot determine home directory");
-        home.join(".config").join("slack_client_rs")
+        let new_dir = home.join(".config").join("shlack");
+        let legacy_dir = home.join(".config").join("slack_client_rs");
+        Self::migrate_legacy_config_dir(&legacy_dir, &new_dir);
+        new_dir
+    }
+
+    /// Copy JSON config from the pre-rebrand `slack_client_rs` directory on first run.
+    fn migrate_legacy_config_dir(legacy_dir: &std::path::Path, new_dir: &std::path::Path) {
+        let legacy_config = legacy_dir.join("slack_config.json");
+        let new_config = new_dir.join("slack_config.json");
+        if new_config.exists() || !legacy_config.exists() {
+            return;
+        }
+        if fs::create_dir_all(new_dir).is_err() {
+            return;
+        }
+        let mut migrated = false;
+        if let Ok(entries) = fs::read_dir(legacy_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Some(name) = path.file_name() {
+                    if fs::copy(&path, new_dir.join(name)).is_ok() {
+                        migrated = true;
+                    }
+                }
+            }
+        }
+        if migrated {
+            println!(
+                "Migrated config from {} to {}",
+                legacy_dir.display(),
+                new_dir.display()
+            );
+        }
     }
 
     pub fn layout_path(&self) -> PathBuf {

@@ -1,5 +1,5 @@
 [package]
-name = "slack_client_rs"
+name = "shlack"
 version = "0.1.0"
 edition = "2021"
 

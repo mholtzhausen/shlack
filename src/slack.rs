@@ -724,7 +724,7 @@ impl SlackClient {
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("/tmp/slack_rust_debug.log")
+            .open("/tmp/shlack_debug.log")
             .and_then(|mut f| {
                 use std::io::Write;
                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
@@ -748,7 +748,7 @@ impl SlackClient {
                 if let Ok(mut file) = OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open("/tmp/slack_rust_debug.log")
+                    .open("/tmp/shlack_debug.log")
                 {
                     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
                     let _ = writeln!(file, "[{}] {}", timestamp, msg);
@@ -1680,7 +1680,7 @@ impl SlackClient {
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/tmp/slack_rust_debug.log")
+                .open("/tmp/shlack_debug.log")
             {
                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
                 let _ = writeln!(file, "[{}] {}", timestamp, msg);
@@ -1776,7 +1776,7 @@ impl SlackClient {
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/tmp/slack_rust_debug.log")
+                .open("/tmp/shlack_debug.log")
             {
                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
                 let _ = writeln!(file, "[{}] {}", timestamp, msg);
@@ -2006,7 +2006,7 @@ impl SlackClient {
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/tmp/slack_rust_debug.log")
+                .open("/tmp/shlack_debug.log")
             {
                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
                 let _ = writeln!(file, "[{}] {}", timestamp, msg);
@@ -2162,7 +2162,7 @@ impl SlackClient {
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/tmp/slack_rust_debug.log")
+                .open("/tmp/shlack_debug.log")
             {
                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
                 let _ = writeln!(file, "[{}] {}", timestamp, msg);
@@ -2228,7 +2228,7 @@ impl SlackClient {
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/tmp/slack_rust_debug.log")
+                .open("/tmp/shlack_debug.log")
             {
                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
                 let _ = writeln!(file, "[{}] {}", timestamp, msg);
@@ -2284,7 +2284,7 @@ impl SlackClient {
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("/tmp/slack_rust_debug.log")
+            .open("/tmp/shlack_debug.log")
             .and_then(|mut f| {
                 use std::io::Write;
                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
@@ -2297,7 +2297,7 @@ impl SlackClient {
             let _ = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/tmp/slack_rust_debug.log")
+                .open("/tmp/shlack_debug.log")
                 .and_then(|mut f| {
                     use std::io::Write;
                     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
@@ -2311,7 +2311,7 @@ impl SlackClient {
             let _ = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/tmp/slack_rust_debug.log")
+                .open("/tmp/shlack_debug.log")
                 .and_then(|mut f| {
                     use std::io::Write;
                     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
