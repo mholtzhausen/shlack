@@ -182,14 +182,28 @@ pub fn draw_chat_list(app: &mut App, f: &mut Frame, area: Rect) {
                 let marker_style = base_style;
 
                 let mut spans = vec![];
-                let prefix = if is_cursor && app.focus_on_chat_list && !is_active {
+                let cursor_mark = if is_cursor && app.focus_on_chat_list && !is_active {
                     "▸ "
-                } else if has_activity || is_active {
-                    "  "
                 } else {
                     "  "
                 };
-                spans.push(Span::styled(prefix.to_string(), base_style));
+                spans.push(Span::styled(cursor_mark.to_string(), base_style));
+
+                let section_label = match chat.section {
+                    crate::models::ChatSection::Public => {
+                        if chat.is_member {
+                            "# ".to_string()
+                        } else {
+                            "+# ".to_string()
+                        }
+                    }
+                    crate::models::ChatSection::Private => "🔒 ".to_string(),
+                    crate::models::ChatSection::Shared => "🔗 ".to_string(),
+                    crate::models::ChatSection::DirectMessage => "👤 ".to_string(),
+                    crate::models::ChatSection::Group => "👥 ".to_string(),
+                    crate::models::ChatSection::Bot => "🤖 ".to_string(),
+                };
+                spans.push(Span::styled(section_label, base_style));
                 spans.push(Span::styled(chat.name.clone(), base_style));
                 if has_activity {
                     spans.push(Span::styled(

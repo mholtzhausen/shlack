@@ -63,14 +63,16 @@ extras            filter by sender/media/link, @-mention tab completion, multi-l
 
 3. generate an app-level token with connections:write
 
-4. oauth & permissions -> add scopes:
-   channels:history channels:read chat:write groups:history groups:read
-   im:history im:read mpim:history mpim:read reactions:write users:read
-   (no extra file scopes: /media uses file urls from message metadata)
+4. oauth & permissions -> paste slack-app-manifest.json (scopes are intentionally
+   over-provisioned for future features: search, pins, stars, uploads, Slack Connect,
+   canvases/lists on paid plans, etc.). Trim scopes before any public App Directory
+   listing. Bot + user scope lists live in the manifest; user tokens (xoxp-) need the
+   user scopes section.
 
-5. features -> event subscriptions -> enable events, subscribe to:
-   message.channels message.groups message.im message.mpim  (edits/deletes included)
-   user_typing (optional, typing indicators).  socket mode needs no request url.
+5. features -> event subscriptions -> the manifest subscribes to message, reaction,
+   membership, channel lifecycle, file, pin, link, emoji, usergroup, and Slack Connect
+   events. socket mode needs no request url.  (user_typing is RTM-only and not in the
+   Events API manifest.)
 
 6. reinstall the app to the workspace after adding events
 
@@ -111,6 +113,7 @@ workspace      Ctrl+N list · Ctrl+1..9 switch · Ctrl+R refresh list · Ctrl+Q 
 /alias <name> <value>    text expansion · /unalias <name> removes
 /workspace [name|num] (/ws)   switch / list workspaces
 /media #XX               download + open media from message #XX
+/join [#channel]         join a public channel (+# in sidebar = not joined yet)
 /leave                   leave the current channel (closes the pane)
 /help  (/h)              show help
 ```

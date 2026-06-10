@@ -42,4 +42,6 @@ pub struct ChatInfo {
     pub username: Option<String>,
     pub unread: u32,
     pub section: ChatSection,
+    /// False for public channels listed via `conversations.list` but not yet joined.
+    pub is_member: bool,
 }

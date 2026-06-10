@@ -183,15 +183,11 @@ impl SlackClient {
         Ok(response.members)
     }
 
-    pub async fn get_conversations(&self) -> Result<Vec<ChatInfo>> {
-        // Use users.conversations which returns everything the current user has
-        // access to (public, private, shared, mpim, im) across paginated results.
+    async fn fetch_paginated_channels(&self, base_url: &str) -> Result<Vec<Channel>> {
         let mut all_channels: Vec<Channel> = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let mut url = String::from(
-                "https://slack.com/api/users.conversations?types=public_channel,private_channel,mpim,im&limit=200&exclude_archived=true",
-            );
+            let mut url = base_url.to_string();
             if let Some(ref c) = cursor {
                 url.push_str(&format!("&cursor={}", c));
             }
@@ -206,7 +202,10 @@ impl SlackClient {
                 .await?;
 
             if !response.ok {
-                return Err(anyhow!("Failed to fetch conversations"));
+                let err = response
+                    .error
+                    .unwrap_or_else(|| "unknown_error".to_string());
+                return Err(anyhow!("Slack API error ({err})"));
             }
 
             all_channels.extend(response.channels);
@@ -222,111 +221,168 @@ impl SlackClient {
                 None => break,
             }
         }
+        Ok(all_channels)
+    }
+
+    pub async fn get_conversations(&self) -> Result<Vec<ChatInfo>> {
+        // Member conversations (DMs, joined channels).
+        let member_channels = self
+            .fetch_paginated_channels(
+                "https://slack.com/api/users.conversations?types=public_channel,private_channel,mpim,im&limit=200&exclude_archived=true",
+            )
+            .await?;
+
+        // All workspace public channels (including ones not yet joined).
+        let public_channels = self
+            .fetch_paginated_channels(
+                "https://slack.com/api/conversations.list?types=public_channel&limit=200&exclude_archived=true",
+            )
+            .await
+            .unwrap_or_else(|e| {
+                tracing::debug!("conversations.list unavailable: {e}");
+                Vec::new()
+            });
+
+        let merged = merge_channels_for_sidebar(member_channels, public_channels);
 
         let my_user_id = self.get_my_user_id().await.unwrap_or_default();
-        let dm_user_ids = all_channels
+        let dm_user_ids = merged
             .iter()
-            .filter(|ch| ch.is_im)
-            .filter_map(|ch| ch.user.clone())
+            .filter(|(ch, _)| ch.is_im)
+            .filter_map(|(ch, _)| ch.user.clone())
             .collect();
         self.prefetch_user_infos(dm_user_ids).await;
 
         let mut chats = Vec::new();
-        for ch in all_channels {
-            if ch.is_archived {
-                continue;
+        for (ch, is_member) in merged {
+            if let Some(info) = self.channel_to_chat_info(&ch, is_member, &my_user_id).await {
+                chats.push(info);
             }
-
-            let dm_user_info = if ch.is_im {
-                if let Some(ref uid) = ch.user {
-                    self.fetch_user_info_cached(uid).await
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            
-            // Skip DMs with deleted users
-            if dm_user_info
-                .as_ref()
-                .map(|info| info.deleted)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
-            // Determine section
-            let section = if ch.is_mpim {
-                ChatSection::Group
-            } else if ch.is_im {
-                if dm_user_info
-                    .as_ref()
-                    .map(|info| info.is_bot)
-                    .unwrap_or(false)
-                {
-                    ChatSection::Bot
-                } else {
-                    ChatSection::DirectMessage
-                }
-            } else if ch.is_ext_shared || ch.is_shared || ch.is_org_shared {
-                ChatSection::Shared
-            } else if ch.is_private || ch.is_group {
-                ChatSection::Private
-            } else {
-                ChatSection::Public
-            };
-
-            let name = match section {
-                ChatSection::Group => {
-                    // Fetch members and build "Name1, Name2" excluding self
-                    match self.get_conversation_members(&ch.id).await {
-                        Ok(members) => {
-                            let members: Vec<String> = members
-                                .into_iter()
-                                .filter(|mid| mid != &my_user_id)
-                                .collect();
-                            self.prefetch_user_infos(members.clone()).await;
-
-                            let mut names = Vec::new();
-                            for mid in &members {
-                                let n = self.resolve_user_name(mid).await;
-                                // Use first name only
-                                let first =
-                                    n.split_whitespace().next().unwrap_or(&n).to_string();
-                                names.push(first);
-                            }
-                            if names.is_empty() {
-                                ch.name.unwrap_or_else(|| ch.id.clone())
-                            } else {
-                                names.join(", ")
-                            }
-                        }
-                        Err(_) => ch.name.unwrap_or_else(|| ch.id.clone()),
-                    }
-                }
-                ChatSection::DirectMessage | ChatSection::Bot => {
-                    if let Some(info) = dm_user_info {
-                        info.name
-                    } else if let Some(ref user_id) = ch.user {
-                        self.resolve_user_name(user_id).await
-                    } else {
-                        ch.name.unwrap_or_else(|| ch.id.clone())
-                    }
-                }
-                _ => ch.name.unwrap_or_else(|| ch.id.clone()),
-            };
-
-            chats.push(ChatInfo {
-                id: ch.id.clone(),
-                name,
-                username: ch.user.or(Some(ch.id)),
-                unread: ch.unread_count.unwrap_or(0),
-                section,
-            });
         }
 
         Ok(chats)
+    }
+
+    async fn channel_to_chat_info(
+        &self,
+        ch: &Channel,
+        is_member: bool,
+        my_user_id: &str,
+    ) -> Option<ChatInfo> {
+        if ch.is_archived {
+            return None;
+        }
+
+        let dm_user_info = if ch.is_im {
+            if let Some(ref uid) = ch.user {
+                self.fetch_user_info_cached(uid).await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if dm_user_info
+            .as_ref()
+            .map(|info| info.deleted)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        let section = if ch.is_mpim {
+            ChatSection::Group
+        } else if ch.is_im {
+            if dm_user_info
+                .as_ref()
+                .map(|info| info.is_bot)
+                .unwrap_or(false)
+            {
+                ChatSection::Bot
+            } else {
+                ChatSection::DirectMessage
+            }
+        } else if ch.is_ext_shared || ch.is_shared || ch.is_org_shared {
+            ChatSection::Shared
+        } else if ch.is_private || ch.is_group {
+            ChatSection::Private
+        } else {
+            ChatSection::Public
+        };
+
+        let name = match section {
+            ChatSection::Group => {
+                match self.get_conversation_members(&ch.id).await {
+                    Ok(members) => {
+                        let members: Vec<String> = members
+                            .into_iter()
+                            .filter(|mid| mid != my_user_id)
+                            .collect();
+                        self.prefetch_user_infos(members.clone()).await;
+
+                        let mut names = Vec::new();
+                        for mid in &members {
+                            let n = self.resolve_user_name(mid).await;
+                            let first = n.split_whitespace().next().unwrap_or(&n).to_string();
+                            names.push(first);
+                        }
+                        if names.is_empty() {
+                            ch.name.clone().unwrap_or_else(|| ch.id.clone())
+                        } else {
+                            names.join(", ")
+                        }
+                    }
+                    Err(_) => ch.name.clone().unwrap_or_else(|| ch.id.clone()),
+                }
+            }
+            ChatSection::DirectMessage | ChatSection::Bot => {
+                if let Some(info) = dm_user_info {
+                    info.name
+                } else if let Some(ref user_id) = ch.user {
+                    self.resolve_user_name(user_id).await
+                } else {
+                    ch.name.clone().unwrap_or_else(|| ch.id.clone())
+                }
+            }
+            _ => ch.name.clone().unwrap_or_else(|| ch.id.clone()),
+        };
+
+        Some(ChatInfo {
+            id: ch.id.clone(),
+            name,
+            username: ch.user.clone().or(Some(ch.id.clone())),
+            unread: ch.unread_count.unwrap_or(0),
+            section,
+            is_member,
+        })
+    }
+
+    /// Join a public channel (required before history/send if not already a member).
+    pub async fn join_conversation(&self, channel_id: &str) -> Result<()> {
+        let response: serde_json::Value = self
+            .http
+            .post("https://slack.com/api/conversations.join")
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "channel": channel_id }))
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        if response
+            .get("ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let err = response
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown_error");
+        Err(anyhow!("Failed to join channel: {err}"))
     }
 
     pub async fn get_conversation_history(
@@ -529,5 +585,59 @@ impl SlackClient {
         }
 
         Ok(())
+    }
+}
+
+/// Merge member channels with workspace public channels (deduped by id).
+pub(crate) fn merge_channels_for_sidebar(
+    member: Vec<Channel>,
+    public: Vec<Channel>,
+) -> Vec<(Channel, bool)> {
+    use std::collections::HashMap;
+    let mut by_id: HashMap<String, (Channel, bool)> = HashMap::new();
+    for ch in member {
+        by_id.insert(ch.id.clone(), (ch, true));
+    }
+    for ch in public {
+        if ch.is_archived {
+            continue;
+        }
+        by_id.entry(ch.id.clone()).or_insert((ch, false));
+    }
+    by_id.into_values().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ch(id: &str, name: &str) -> Channel {
+        Channel {
+            id: id.to_string(),
+            name: Some(name.to_string()),
+            user: None,
+            is_group: false,
+            is_im: false,
+            is_mpim: false,
+            is_private: false,
+            is_archived: false,
+            is_member: true,
+            is_shared: false,
+            is_ext_shared: false,
+            is_org_shared: false,
+            unread_count: None,
+        }
+    }
+
+    #[test]
+    fn merge_prefers_member_over_public_listing() {
+        let member = vec![ch("C1", "general")];
+        let public = vec![ch("C1", "general"), ch("C2", "random")];
+        let merged = merge_channels_for_sidebar(member, public);
+        assert_eq!(merged.len(), 2);
+        let c1 = merged.iter().find(|(c, _)| c.id == "C1").unwrap();
+        assert!(c1.1);
+        let c2 = merged.iter().find(|(c, _)| c.id == "C2").unwrap();
+        assert!(!c2.1);
     }
 }

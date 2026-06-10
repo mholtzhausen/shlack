@@ -61,6 +61,9 @@ impl CommandHandler {
             "leave" => {
                 Self::handle_leave(app).await?;
             }
+            "join" => {
+                Self::handle_join(app, &cmd).await?;
+            }
             "help" | "h" => {
                 Self::handle_help(app).await?;
             }
@@ -230,6 +233,50 @@ impl CommandHandler {
             app.set_status(&format!("Removed alias '{}'", alias_name));
         } else {
             app.set_status(&format!("Alias '{}' not found", alias_name));
+        }
+
+        Ok(())
+    }
+
+    async fn handle_join(app: &mut App, cmd: &Command) -> Result<()> {
+        let name = if cmd.args.is_empty() {
+            app.chats
+                .get(app.selected_chat_idx)
+                .map(|c| c.name.clone())
+        } else {
+            Some(cmd.args[0].trim_start_matches('#').to_string())
+        };
+
+        let Some(target_name) = name else {
+            app.set_status("Usage: /join [#channel] (select a channel or give a name)");
+            return Ok(());
+        };
+
+        let channel_id = app
+            .chats
+            .iter()
+            .find(|c| {
+                c.section == crate::models::ChatSection::Public
+                    && c.name.eq_ignore_ascii_case(&target_name)
+            })
+            .map(|c| c.id.clone());
+
+        let Some(channel_id) = channel_id else {
+            app.set_status(&format!("Public channel '{}' not found — try Ctrl+R", target_name));
+            return Ok(());
+        };
+
+        match app.slack.join_conversation(&channel_id).await {
+            Ok(_) => {
+                if let Some(chat) = app.chats.iter_mut().find(|c| c.id == channel_id) {
+                    chat.is_member = true;
+                }
+                app.set_status(&format!("Joined #{}", target_name));
+                app.needs_redraw = true;
+            }
+            Err(e) => {
+                app.set_status(&format!("Failed to join: {}", e));
+            }
         }
 
         Ok(())
@@ -422,7 +469,7 @@ impl CommandHandler {
     }
 
     async fn handle_help(app: &mut App) -> Result<()> {
-        app.set_status("Commands: /thread N | /react <emoji> | /filter | /workspace | /leave | /alias | /media #N | /help");
+        app.set_status("Commands: /thread N | /react <emoji> | /filter | /join [#ch] | /leave | /workspace | /alias | /media #N | /help");
         Ok(())
     }
 }

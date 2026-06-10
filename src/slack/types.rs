@@ -304,6 +304,8 @@ pub(crate) struct ConversationsListResponse {
     pub(crate) ok: bool,
     pub(crate) channels: Vec<Channel>,
     #[serde(default)]
+    pub(crate) error: Option<String>,
+    #[serde(default)]
     pub(crate) response_metadata: Option<ResponseMetadata>,
 }
 

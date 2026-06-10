@@ -83,6 +83,7 @@ struct OpenChatLoadResult {
     channel_id: String,
     messages: Vec<SlackMessage>,
     name_cache: std::collections::HashMap<String, String>,
+    joined_channel: bool,
 }
 
 /// Load persisted threads for the given workspace and convert into runtime
@@ -428,11 +429,25 @@ impl App {
         self.pending_open_chat_load = None;
         let slack = self.slack.clone();
         let channel_id = chat.id.clone();
+        let needs_join = !chat.is_member;
         let known_names = self.user_name_cache.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
 
+        if needs_join {
+            self.set_status(&format!("Joining #{}...", chat.name));
+        }
+
         tokio::spawn(async move {
             let result = async {
+                let mut joined_channel = false;
+                if needs_join {
+                    slack
+                        .join_conversation(&channel_id)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    joined_channel = true;
+                }
+
                 let messages = slack
                     .get_conversation_history(&channel_id, 100)
                     .await
@@ -480,6 +495,7 @@ impl App {
                     channel_id: channel_id.clone(),
                     messages,
                     name_cache,
+                    joined_channel,
                 })
             }
             .await;
@@ -1385,6 +1401,15 @@ impl App {
                     pane.scroll_offset = usize::MAX;
                     pane.chat_name.clone()
                 };
+                if load.joined_channel {
+                    if let Some(chat) = self
+                        .chats
+                        .iter_mut()
+                        .find(|c| c.id == load.channel_id)
+                    {
+                        chat.is_member = true;
+                    }
+                }
                 // Backfill the Threads section from this loaded history. We
                 // only see parent messages here (history doesn't return replies
                 // inline), so we seed threads where either the parent is mine
