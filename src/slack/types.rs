@@ -31,6 +31,36 @@ pub enum SlackUpdate {
         channel_id: String,
         user_name: String,
     },
+    ReactionAdded {
+        channel_id: String,
+        message_ts: String,
+        reaction: String,
+    },
+    ReactionRemoved {
+        channel_id: String,
+        message_ts: String,
+        reaction: String,
+    },
+    MemberJoinedChannel {
+        channel_id: String,
+        user_id: String,
+    },
+    MemberLeftChannel {
+        channel_id: String,
+        user_id: String,
+    },
+    ChannelRenamed {
+        channel_id: String,
+        name: String,
+    },
+    ChannelLifecycle {
+        channel_id: String,
+        archived: bool,
+    },
+    UserProfileChanged {
+        user_id: String,
+    },
+    RefreshChatList,
 }
 
 #[derive(Deserialize, Serialize, Clone)]

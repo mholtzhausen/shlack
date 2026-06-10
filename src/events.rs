@@ -5,6 +5,7 @@ use crate::messages::realtime_message_to_message_data;
 use crate::models::{ChatSection, ThreadInfo};
 use crate::slack::SlackUpdate;
 use crate::utils::send_desktop_notification_ex;
+use crate::widgets::MessageData;
 
 const UNREAD_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 
@@ -33,6 +34,86 @@ pub(crate) fn debounced_save_due(last_save: Option<Instant>, now: Instant) -> bo
     last_save
         .map(|t| now.duration_since(t) >= UNREAD_SAVE_DEBOUNCE)
         .unwrap_or(true)
+}
+
+pub(crate) fn apply_reaction_added(msg: &mut MessageData, reaction: &str) {
+    if let Some((_, count)) = msg
+        .reactions
+        .iter_mut()
+        .find(|(name, _)| name == reaction)
+    {
+        *count = count.saturating_add(1);
+    } else {
+        msg.reactions.push((reaction.to_string(), 1));
+    }
+}
+
+pub(crate) fn apply_reaction_removed(msg: &mut MessageData, reaction: &str) {
+    if let Some(pos) = msg.reactions.iter().position(|(name, _)| name == reaction) {
+        if msg.reactions[pos].1 <= 1 {
+            msg.reactions.remove(pos);
+        } else {
+            msg.reactions[pos].1 -= 1;
+        }
+    }
+}
+
+fn update_reactions_in_panes(
+    app: &mut App,
+    channel_id: &str,
+    message_ts: &str,
+    add: bool,
+    reaction: &str,
+) {
+    for pane in &mut app.panes {
+        if pane.channel_id_str.as_deref() != Some(channel_id) {
+            continue;
+        }
+        if let Some(msg) = pane.msg_data.iter_mut().find(|m| m.ts == message_ts) {
+            if add {
+                apply_reaction_added(msg, reaction);
+            } else {
+                apply_reaction_removed(msg, reaction);
+            }
+            pane.invalidate_cache();
+            app.needs_redraw = true;
+        }
+    }
+}
+
+fn rename_channel_in_app(app: &mut App, channel_id: &str, name: &str) {
+    if let Some(chat) = app.chats.iter_mut().find(|c| c.id == channel_id) {
+        chat.name = name.to_string();
+    }
+    for pane in &mut app.panes {
+        if pane.channel_id_str.as_deref() == Some(channel_id) {
+            pane.chat_name = name.to_string();
+        }
+    }
+    for thread in &mut app.threads {
+        if thread.channel_id == channel_id {
+            thread.channel_name = name.to_string();
+        }
+    }
+    app.needs_redraw = true;
+}
+
+fn remove_channel_from_sidebar(app: &mut App, channel_id: &str) {
+    app.chats.retain(|c| c.id != channel_id);
+    if app.selected_chat_idx >= app.chats.len() {
+        app.selected_chat_idx = app.chats.len().saturating_sub(1);
+    }
+    app.threads.retain(|t| t.channel_id != channel_id);
+    app.threads_dirty = true;
+    app.unread_dirty = true;
+    app.needs_redraw = true;
+}
+
+fn set_channel_membership(app: &mut App, channel_id: &str, is_member: bool) {
+    if let Some(chat) = app.chats.iter_mut().find(|c| c.id == channel_id) {
+        chat.is_member = is_member;
+        app.needs_redraw = true;
+    }
 }
 
 pub fn apply_update(app: &mut App, update: SlackUpdate) {
@@ -363,6 +444,54 @@ pub fn apply_update(app: &mut App, update: SlackUpdate) {
             }
             app.needs_redraw = true;
         }
+        SlackUpdate::ReactionAdded {
+            channel_id,
+            message_ts,
+            reaction,
+        } => {
+            update_reactions_in_panes(app, &channel_id, &message_ts, true, &reaction);
+        }
+        SlackUpdate::ReactionRemoved {
+            channel_id,
+            message_ts,
+            reaction,
+        } => {
+            update_reactions_in_panes(app, &channel_id, &message_ts, false, &reaction);
+        }
+        SlackUpdate::MemberJoinedChannel {
+            channel_id,
+            user_id,
+        } => {
+            if user_id == app.my_user_id {
+                set_channel_membership(app, &channel_id, true);
+            }
+        }
+        SlackUpdate::MemberLeftChannel {
+            channel_id,
+            user_id,
+        } => {
+            if user_id == app.my_user_id {
+                set_channel_membership(app, &channel_id, false);
+            }
+        }
+        SlackUpdate::ChannelRenamed { channel_id, name } => {
+            rename_channel_in_app(app, &channel_id, &name);
+        }
+        SlackUpdate::ChannelLifecycle { channel_id, archived } => {
+            if archived {
+                remove_channel_from_sidebar(app, &channel_id);
+            } else {
+                app.pending_refresh_chats = true;
+            }
+        }
+        SlackUpdate::UserProfileChanged { user_id } => {
+            app.user_name_cache.remove(&user_id);
+            app.slack.invalidate_user_caches(&user_id);
+            app.needs_redraw = true;
+        }
+        SlackUpdate::RefreshChatList => {
+            app.pending_refresh_chats = true;
+        }
     }
 }
 
@@ -407,6 +536,62 @@ mod tests {
         assert!(thread_concerns_me(false, true, false, false));
         assert!(thread_concerns_me(false, false, true, false));
         assert!(thread_concerns_me(false, false, false, true));
+    }
+
+    #[test]
+    fn reaction_added_increments_or_inserts() {
+        let mut msg = MessageData {
+            sender_name: "a".into(),
+            text: "hi".into(),
+            is_outgoing: false,
+            ts: "1".into(),
+            reactions: vec![("thumbsup".into(), 2)],
+            reply_count: 0,
+            cards: vec![],
+            mentions_me: false,
+            local_echo_id: None,
+            is_edited: false,
+            is_deleted: false,
+            media_type: None,
+            file_ids: vec![],
+            file_urls: vec![],
+            file_names: vec![],
+        };
+        apply_reaction_added(&mut msg, "thumbsup");
+        assert_eq!(msg.reactions, vec![("thumbsup".to_string(), 3)]);
+        apply_reaction_added(&mut msg, "fire");
+        assert_eq!(
+            msg.reactions,
+            vec![
+                ("thumbsup".to_string(), 3),
+                ("fire".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn reaction_removed_drops_or_decrements() {
+        let mut msg = MessageData {
+            sender_name: "a".into(),
+            text: "hi".into(),
+            is_outgoing: false,
+            ts: "1".into(),
+            reactions: vec![("thumbsup".into(), 2)],
+            reply_count: 0,
+            cards: vec![],
+            mentions_me: false,
+            local_echo_id: None,
+            is_edited: false,
+            is_deleted: false,
+            media_type: None,
+            file_ids: vec![],
+            file_urls: vec![],
+            file_names: vec![],
+        };
+        apply_reaction_removed(&mut msg, "thumbsup");
+        assert_eq!(msg.reactions, vec![("thumbsup".to_string(), 1)]);
+        apply_reaction_removed(&mut msg, "thumbsup");
+        assert!(msg.reactions.is_empty());
     }
 
     #[test]

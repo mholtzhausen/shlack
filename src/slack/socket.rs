@@ -411,6 +411,108 @@ impl SlackClient {
                         });
                     }
                 }
+                "reaction_added" | "reaction_removed" => {
+                    if let (Some(item), Some(reaction)) = (
+                        event.get("item"),
+                        event.get("reaction").and_then(|v| v.as_str()),
+                    ) {
+                        if item.get("type").and_then(|v| v.as_str()) == Some("message") {
+                            if let (Some(channel_id), Some(message_ts)) = (
+                                item.get("channel").and_then(|v| v.as_str()),
+                                item.get("ts").and_then(|v| v.as_str()),
+                            ) {
+                                let update = if event_type == "reaction_added" {
+                                    SlackUpdate::ReactionAdded {
+                                        channel_id: channel_id.to_string(),
+                                        message_ts: message_ts.to_string(),
+                                        reaction: reaction.to_string(),
+                                    }
+                                } else {
+                                    SlackUpdate::ReactionRemoved {
+                                        channel_id: channel_id.to_string(),
+                                        message_ts: message_ts.to_string(),
+                                        reaction: reaction.to_string(),
+                                    }
+                                };
+                                pending_updates.lock().await.push(update);
+                            }
+                        }
+                    }
+                }
+                "member_joined_channel" => {
+                    if let (Some(channel_id), Some(user_id)) = (
+                        event.get("channel").and_then(|v| v.as_str()),
+                        event.get("user").and_then(|v| v.as_str()),
+                    ) {
+                        pending_updates.lock().await.push(SlackUpdate::MemberJoinedChannel {
+                            channel_id: channel_id.to_string(),
+                            user_id: user_id.to_string(),
+                        });
+                    }
+                }
+                "member_left_channel" => {
+                    if let (Some(channel_id), Some(user_id)) = (
+                        event.get("channel").and_then(|v| v.as_str()),
+                        event.get("user").and_then(|v| v.as_str()),
+                    ) {
+                        pending_updates.lock().await.push(SlackUpdate::MemberLeftChannel {
+                            channel_id: channel_id.to_string(),
+                            user_id: user_id.to_string(),
+                        });
+                    }
+                }
+                "channel_rename" => {
+                    if let Some(channel) = event.get("channel") {
+                        if let (Some(channel_id), Some(name)) = (
+                            channel.get("id").and_then(|v| v.as_str()),
+                            channel.get("name").and_then(|v| v.as_str()),
+                        ) {
+                            pending_updates.lock().await.push(SlackUpdate::ChannelRenamed {
+                                channel_id: channel_id.to_string(),
+                                name: name.to_string(),
+                            });
+                        }
+                    }
+                }
+                "channel_archive" | "channel_deleted" => {
+                    if let Some(channel_id) = event.get("channel").and_then(|v| v.as_str()) {
+                        pending_updates.lock().await.push(SlackUpdate::ChannelLifecycle {
+                            channel_id: channel_id.to_string(),
+                            archived: true,
+                        });
+                    }
+                }
+                "channel_unarchive" => {
+                    if let Some(channel_id) = event.get("channel").and_then(|v| v.as_str()) {
+                        pending_updates.lock().await.push(SlackUpdate::ChannelLifecycle {
+                            channel_id: channel_id.to_string(),
+                            archived: false,
+                        });
+                    }
+                }
+                "channel_created"
+                | "channel_id_changed"
+                | "team_join"
+                | "shared_channel_invite_accepted"
+                | "shared_channel_invite_approved"
+                | "shared_channel_invite_declined"
+                | "shared_channel_invite_received" => {
+                    pending_updates.lock().await.push(SlackUpdate::RefreshChatList);
+                }
+                "user_change" => {
+                    if let Some(user_id) = event.get("user").and_then(|v| v.as_str()) {
+                        pending_updates.lock().await.push(SlackUpdate::UserProfileChanged {
+                            user_id: user_id.to_string(),
+                        });
+                    }
+                }
+                "user_profile_changed" => {
+                    if let Some(user_id) = event.get("user").and_then(|v| v.get("id")).and_then(|v| v.as_str()) {
+                        pending_updates.lock().await.push(SlackUpdate::UserProfileChanged {
+                            user_id: user_id.to_string(),
+                        });
+                    }
+                }
                 _ => {}
             }
         }

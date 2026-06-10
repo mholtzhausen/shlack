@@ -72,6 +72,16 @@ impl SlackClient {
         let mut updates = self.pending_updates.lock().await;
         std::mem::take(&mut *updates)
     }
+
+    /// Drop cached display info for a user (after profile change events).
+    pub fn invalidate_user_caches(&self, user_id: &str) {
+        if let Ok(mut cache) = self.user_name_cache.try_lock() {
+            cache.remove(user_id);
+        }
+        if let Ok(mut cache) = self.user_info_cache.try_lock() {
+            cache.remove(user_id);
+        }
+    }
     pub async fn shutdown(&self) {
         tracing::debug!("shutdown() called");
         // Send shutdown signal to gracefully close WebSocket
